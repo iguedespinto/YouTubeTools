@@ -1,0 +1,331 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <h1>Your Playlists</h1>
+  <div class="actions">
+    <a class="btn secondary" href="{{ url_for('logout') }}">Disconnect</a>
+  </div>
+  <div class="meta">Total playlists: {{ total_playlists }} · Total videos: {{ total_videos }}</div>
+  <form method="get" class="actions">
+    <label>
+      Sort by
+      <select name="sort">
+        <option value="title" {% if sort_by == "title" %}selected{% endif %}>Title</option>
+        <option value="count" {% if sort_by == "count" %}selected{% endif %}>Video count</option>
+      </select>
+    </label>
+    <label>
+      Order
+      <select name="order">
+        <option value="asc" {% if sort_order == "asc" %}selected{% endif %}>Ascending</option>
+        <option value="desc" {% if sort_order == "desc" %}selected{% endif %}>Descending</option>
+      </select>
+    </label>
+    <button class="btn" type="submit">Apply</button>
+  </form>
+  {% if playlists %}
+    <div class="playlist-layout">
+      <div class="playlist-list-pane">
+        <div class="bulk-actions">
+          <label>
+            Max videos
+            <input type="number" id="count-threshold" min="0" step="1" placeholder="e.g. 10">
+          </label>
+          <button class="btn secondary" type="button" id="select-by-count">Select ≤ X</button>
+          <button class="btn danger" type="button" id="delete-selected" disabled>Delete selected</button>
+        </div>
+        <ul class="playlist-list">
+          {% for playlist in playlists %}
+            <li data-playlist-id="{{ playlist.id }}" data-count="{{ playlist.contentDetails.itemCount }}">
+              <input type="checkbox" class="playlist-select">
+              <form method="post" class="delete-form" action="{{ url_for('delete_playlist', playlist_id=playlist.id, sort=sort_by, order=sort_order) }}">
+                <button class="btn danger" type="submit">Delete</button>
+              </form>
+              <button class="btn secondary view-button" type="button" data-playlist-id="{{ playlist.id }}">
+                View
+              </button>
+              <div class="playlist-info">
+                <div>
+                  <strong>
+                    <a class="playlist-link" href="https://www.youtube.com/playlist?list={{ playlist.id }}" target="_blank" rel="noopener noreferrer">
+                      {{ playlist.snippet.title }}
+                    </a>
+                  </strong>
+                </div>
+                <div class="meta">
+                  {{ playlist.contentDetails.itemCount }} videos
+                </div>
+              </div>
+            </li>
+          {% endfor %}
+        </ul>
+      </div>
+      <div class="playlist-viewer-pane">
+        <div class="viewer-header">
+          <div>
+            <div id="playlist-viewer-title">Playlist videos</div>
+            <div id="playlist-viewer-status" class="viewer-status"></div>
+          </div>
+          <button class="btn danger" type="button" id="delete-selected-videos" disabled>Delete selected videos</button>
+        </div>
+        <div id="playlist-viewer" class="viewer-list">
+          <div class="viewer-hint">Select a playlist to load its videos.</div>
+        </div>
+      </div>
+    </div>
+  {% else %}
+    <p>No playlists found.</p>
+  {% endif %}
+
+  <script>
+    const viewer = document.getElementById('playlist-viewer');
+    const bulkDeleteButton = document.getElementById('delete-selected');
+    const countInput = document.getElementById('count-threshold');
+
+    const viewerTitle = document.getElementById('playlist-viewer-title');
+    const viewerStatus = document.getElementById('playlist-viewer-status');
+    const deleteSelectedVideosButton = document.getElementById('delete-selected-videos');
+    let currentPlaylistId = null;
+
+    function updateVideoDeleteState() {
+      if (!deleteSelectedVideosButton) return;
+      const anySelected = viewer.querySelectorAll('.video-select:checked').length > 0;
+      deleteSelectedVideosButton.disabled = !anySelected;
+    }
+
+    function loadPlaylistVideos(playlistId, playlistTitle, rowElement) {
+      if (!playlistId) return;
+      currentPlaylistId = playlistId;
+      if (viewerTitle && playlistTitle) {
+        viewerTitle.textContent = `Playlist videos: ${playlistTitle}`;
+      }
+      if (viewerStatus) {
+        viewerStatus.textContent = '';
+      }
+      document.querySelectorAll('.playlist-list li').forEach((li) => {
+        li.classList.remove('active');
+      });
+      if (rowElement) {
+        rowElement.classList.add('active');
+      }
+      viewer.innerHTML = '<div class="viewer-hint">Loading...</div>';
+      fetch(`/playlist/${playlistId}/items`)
+        .then((response) => response.json())
+        .then((data) => {
+          if (!data.items || !data.items.length) {
+            viewer.innerHTML = '<div class="viewer-hint">No videos found.</div>';
+            return;
+          }
+          const list = document.createElement('ol');
+          list.className = 'viewer-items';
+          data.items.forEach((item) => {
+            const title = item?.title || 'Untitled video';
+            const thumbUrl = item?.thumbnail || '';
+            const videoId = item?.videoId;
+            const playlistItemId = item?.playlistItemId;
+            const listItem = document.createElement('li');
+            listItem.dataset.playlistItemId = playlistItemId || '';
+            const link = document.createElement('a');
+            const thumb = document.createElement('img');
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.className = 'video-select';
+            thumb.className = 'video-thumb';
+            thumb.alt = '';
+            if (thumbUrl) {
+              thumb.src = thumbUrl;
+            }
+            link.textContent = title;
+            if (videoId) {
+              link.href = `https://www.youtube.com/watch?v=${videoId}`;
+              link.target = '_blank';
+              link.rel = 'noopener noreferrer';
+            }
+            checkbox.addEventListener('change', updateVideoDeleteState);
+            listItem.appendChild(checkbox);
+            listItem.appendChild(thumb);
+            listItem.appendChild(link);
+            list.appendChild(listItem);
+          });
+          viewer.innerHTML = '';
+          viewer.appendChild(list);
+          updateVideoDeleteState();
+        })
+        .catch(() => {
+          viewer.innerHTML = '<div class="viewer-hint">Failed to load videos.</div>';
+        });
+    }
+
+    document.querySelectorAll('.view-button').forEach((button) => {
+      button.addEventListener('click', () => {
+        const li = button.closest('li');
+        const title = li ? li.querySelector('.playlist-link')?.textContent?.trim() : '';
+        loadPlaylistVideos(button.dataset.playlistId, title, li);
+      });
+    });
+
+    document.querySelectorAll('.playlist-list li').forEach((row) => {
+      row.addEventListener('click', (event) => {
+        if (event.target.closest('button') || event.target.closest('a') || event.target.closest('input')) {
+          return;
+        }
+        const title = row.querySelector('.playlist-link')?.textContent?.trim() || '';
+        loadPlaylistVideos(row.dataset.playlistId, title, row);
+      });
+    });
+
+    if (deleteSelectedVideosButton) {
+      deleteSelectedVideosButton.addEventListener('click', () => {
+        const selected = Array.from(viewer.querySelectorAll('.video-select:checked'))
+          .map((checkbox) => checkbox.closest('li'))
+          .filter(Boolean);
+        if (!selected.length || !currentPlaylistId) return;
+        if (!confirm(`Remove ${selected.length} video(s) from this playlist?`)) return;
+        deleteSelectedVideosButton.disabled = true;
+        const originalLabel = deleteSelectedVideosButton.textContent;
+        deleteSelectedVideosButton.textContent = 'Deleting...';
+        if (viewerStatus) {
+          viewerStatus.textContent = `Removing: 0 of ${selected.length}`;
+        }
+        const itemIds = selected.map((li) => li.dataset.playlistItemId).filter(Boolean);
+        fetch(`/playlist/${currentPlaylistId}/items/delete-bulk`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+          body: JSON.stringify({ playlist_item_ids: itemIds }),
+        })
+          .then((response) => response.json())
+          .then((data) => {
+            if (!data.success && data.failures && data.failures.length) {
+              const failedIds = new Set(data.failures.map((item) => item.id));
+              selected.forEach((li) => {
+                if (!failedIds.has(li.dataset.playlistItemId)) {
+                  li.remove();
+                }
+              });
+              alert('Some videos could not be removed.');
+            } else {
+              selected.forEach((li) => li.remove());
+            }
+            if (viewerStatus) {
+              viewerStatus.textContent = `Removing: ${selected.length} of ${selected.length}`;
+            }
+            updateVideoDeleteState();
+          })
+          .catch(() => {
+            alert('Failed to remove videos.');
+          })
+          .finally(() => {
+            deleteSelectedVideosButton.textContent = originalLabel;
+            if (viewerStatus) {
+              setTimeout(() => {
+                viewerStatus.textContent = '';
+              }, 1500);
+            }
+            updateVideoDeleteState();
+          });
+      });
+    }
+
+    document.querySelectorAll('.delete-form').forEach((form) => {
+      form.addEventListener('submit', (event) => {
+        event.preventDefault();
+        if (!confirm('Delete this playlist?')) return;
+        fetch(form.action, {
+          method: 'POST',
+          headers: { 'X-Requested-With': 'XMLHttpRequest' },
+        })
+          .then((response) => response.json())
+          .then((data) => {
+            if (!data.success) {
+              alert(data.error || 'Failed to delete playlist.');
+              return;
+            }
+            const li = form.closest('li');
+            if (li) li.remove();
+            updateBulkState();
+          })
+          .catch(() => {
+            alert('Failed to delete playlist.');
+          });
+      });
+    });
+
+    function updateBulkState() {
+      const anySelected = document.querySelectorAll('.playlist-select:checked').length > 0;
+      if (bulkDeleteButton) {
+        bulkDeleteButton.disabled = !anySelected;
+      }
+    }
+
+    document.querySelectorAll('.playlist-select').forEach((checkbox) => {
+      checkbox.addEventListener('change', updateBulkState);
+    });
+
+    const selectByCount = document.getElementById('select-by-count');
+    if (selectByCount) {
+      selectByCount.addEventListener('click', () => {
+        const threshold = parseInt(countInput.value, 10);
+        if (Number.isNaN(threshold)) {
+          alert('Enter a valid number.');
+          return;
+        }
+        document.querySelectorAll('.playlist-list li').forEach((li) => {
+          const count = parseInt(li.dataset.count || '0', 10);
+          const checkbox = li.querySelector('.playlist-select');
+          if (checkbox) {
+            checkbox.checked = count <= threshold;
+          }
+        });
+        updateBulkState();
+      });
+    }
+
+    if (bulkDeleteButton) {
+      bulkDeleteButton.addEventListener('click', async () => {
+        const selected = Array.from(document.querySelectorAll('.playlist-select:checked'))
+          .map((checkbox) => checkbox.closest('li'))
+          .filter(Boolean);
+        if (!selected.length) return;
+        if (!confirm(`Delete ${selected.length} playlist(s)?`)) return;
+        bulkDeleteButton.disabled = true;
+        const originalLabel = bulkDeleteButton.textContent;
+        const total = selected.length;
+        let completed = 0;
+        const failures = [];
+        bulkDeleteButton.textContent = `Deleting... ${completed} of ${total}`;
+        for (const li of selected) {
+          const playlistId = li.dataset.playlistId;
+          if (!playlistId) {
+            completed += 1;
+            bulkDeleteButton.textContent = `Deleting... ${completed} of ${total}`;
+            continue;
+          }
+          try {
+            const response = await fetch(`/delete/${playlistId}`, {
+              method: 'POST',
+              headers: { 'X-Requested-With': 'XMLHttpRequest' },
+            });
+            const data = await response.json();
+            if (data.success) {
+              li.remove();
+            } else {
+              failures.push(playlistId);
+            }
+          } catch {
+            failures.push(playlistId);
+          }
+          completed += 1;
+          bulkDeleteButton.textContent = `Deleting... ${completed} of ${total}`;
+        }
+        if (failures.length) {
+          alert('Some playlists could not be deleted.');
+        }
+        bulkDeleteButton.textContent = originalLabel;
+        updateBulkState();
+      });
+    }
+  </script>
+{% endblock %}

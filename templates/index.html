@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <h1>YouTube Playlists</h1>
+  <p>Connect your YouTube account to list your playlists.</p>
+  <div class="actions">
+    <a class="btn" href="{{ url_for('login') }}">Connect YouTube</a>
+  </div>
+{% endblock %}
