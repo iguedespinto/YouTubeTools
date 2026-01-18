@@ -6,37 +6,47 @@
     <a class="btn secondary" href="{{ url_for('logout') }}">Disconnect</a>
   </div>
   <div class="meta">Total playlists: {{ total_playlists }} · Total videos: {{ total_videos }}</div>
-  <form method="get" class="actions">
-    <label>
-      Sort by
-      <select name="sort">
-        <option value="title" {% if sort_by == "title" %}selected{% endif %}>Title</option>
-        <option value="count" {% if sort_by == "count" %}selected{% endif %}>Video count</option>
-      </select>
-    </label>
-    <label>
-      Order
-      <select name="order">
-        <option value="asc" {% if sort_order == "asc" %}selected{% endif %}>Ascending</option>
-        <option value="desc" {% if sort_order == "desc" %}selected{% endif %}>Descending</option>
-      </select>
-    </label>
-    <button class="btn" type="submit">Apply</button>
+  <form method="get">
+    <div class="actions">
+      <label>
+        Sort by
+        <select name="sort">
+          <option value="title" {% if sort_by == "title" %}selected{% endif %}>Title</option>
+          <option value="count" {% if sort_by == "count" %}selected{% endif %}>Video count</option>
+        </select>
+      </label>
+      <label>
+        Order
+        <select name="order">
+          <option value="asc" {% if sort_order == "asc" %}selected{% endif %}>Ascending</option>
+          <option value="desc" {% if sort_order == "desc" %}selected{% endif %}>Descending</option>
+        </select>
+      </label>
+      <button class="btn" type="submit">Apply</button>
+    </div>
+    <div class="actions">
+      <label>
+        Max videos
+        <input type="number" id="count-threshold" min="0" step="1" placeholder="e.g. 10">
+      </label>
+      <button class="btn secondary" type="button" id="select-by-count">Select ≤ X</button>
+    </div>
+    <div class="actions">
+      <label>
+        Search
+        <input type="text" id="playlist-search" placeholder="Type to filter playlists">
+      </label>
+    </div>
   </form>
   {% if playlists %}
     <div class="playlist-layout">
       <div class="playlist-list-pane">
-        <div class="bulk-actions">
-          <label>
-            Max videos
-            <input type="number" id="count-threshold" min="0" step="1" placeholder="e.g. 10">
-          </label>
-          <button class="btn secondary" type="button" id="select-by-count">Select ≤ X</button>
-          <button class="btn danger" type="button" id="delete-selected" disabled>Delete selected</button>
-          <button class="btn secondary" type="button" id="merge-selected" disabled>Merge selected</button>
+        <div class="bulk-actions actions">
+          <button class="btn danger" type="button" id="delete-selected" style="display: none;" disabled>Delete selected</button>
+          <button class="btn secondary" type="button" id="merge-selected" style="display: none;" disabled>Merge selected</button>
           <span id="merge-status" class="merge-status"></span>
         </div>
-        <ul class="playlist-list">
+        <ul class="playlist-list" id="playlist-list">
           {% for playlist in playlists %}
             <li data-playlist-id="{{ playlist.id }}" data-count="{{ playlist.contentDetails.itemCount }}">
               <input type="checkbox" class="playlist-select">
@@ -49,7 +59,7 @@
               <div class="playlist-info">
                 <div>
                   <strong>
-                    <a class="playlist-link" href="https://www.youtube.com/playlist?list={{ playlist.id }}" target="_blank" rel="noopener noreferrer">
+                    <a class="playlist-link" href="https://www.youtube.com/playlist?list={{ playlist.id }}" target="_blank" rel="noopener noreferrer" data-title="{{ playlist.snippet.title }}">
                       {{ playlist.snippet.title }}
                     </a>
                   </strong>
@@ -84,6 +94,9 @@
     const bulkDeleteButton = document.getElementById('delete-selected');
     const mergeSelectedButton = document.getElementById('merge-selected');
     const mergeStatus = document.getElementById('merge-status');
+    const playlistSearch = document.getElementById('playlist-search');
+    const playlistList = document.getElementById('playlist-list');
+    let searchTimer = null;
     const countInput = document.getElementById('count-threshold');
 
     const viewerTitle = document.getElementById('playlist-viewer-title');
@@ -178,6 +191,27 @@
       });
     });
 
+    function applyPlaylistSearch(term) {
+      const normalized = term.trim().toLowerCase();
+      const rows = playlistList ? Array.from(playlistList.querySelectorAll('li')) : [];
+      rows.forEach((row) => {
+        const title = row.querySelector('.playlist-link')?.dataset.title || '';
+        const matches = title.toLowerCase().includes(normalized);
+        row.style.display = matches ? '' : 'none';
+      });
+    }
+
+    if (playlistSearch) {
+      playlistSearch.addEventListener('input', () => {
+        if (searchTimer) {
+          clearTimeout(searchTimer);
+        }
+        searchTimer = setTimeout(() => {
+          applyPlaylistSearch(playlistSearch.value);
+        }, 1000);
+      });
+    }
+
     if (deleteSelectedVideosButton) {
       deleteSelectedVideosButton.addEventListener('click', () => {
         const selected = Array.from(viewer.querySelectorAll('.video-select:checked'))
@@ -262,9 +296,11 @@
       const selectedCount = document.querySelectorAll('.playlist-select:checked').length;
       if (bulkDeleteButton) {
         bulkDeleteButton.disabled = !anySelected;
+        bulkDeleteButton.style.display = anySelected ? 'inline-block' : 'none';
       }
       if (mergeSelectedButton) {
         mergeSelectedButton.disabled = selectedCount < 2;
+        mergeSelectedButton.style.display = selectedCount >= 2 ? 'inline-block' : 'none';
       }
     }
 
