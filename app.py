@@ -315,6 +315,75 @@ def delete_playlist_items_bulk(playlist_id):
     return {"success": len(failures) == 0, "failures": failures}
 
 
+@app.route("/merge-playlists", methods=["POST"])
+def merge_playlists():
+    credentials = session.get("credentials") or load_saved_credentials()
+    if not credentials:
+        return {"error": "Not authenticated"}, 401
+    payload = request.get_json(silent=True) or {}
+    target_id = payload.get("target_id")
+    source_ids = payload.get("source_ids") or []
+    new_name = (payload.get("new_name") or "").strip()
+    if not target_id or not isinstance(source_ids, list) or len(source_ids) < 1:
+        return {"error": "Invalid playlist selection"}, 400
+    if not new_name:
+        return {"error": "New name is required"}, 400
+    normalized = normalize_saved_credentials(credentials) or credentials
+    creds = Credentials(**normalized)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        save_credentials(creds)
+    youtube = build("youtube", "v3", credentials=creds)
+
+    failures = []
+    added = 0
+    for playlist_id in source_ids:
+        request_page = youtube.playlistItems().list(
+            part="contentDetails",
+            playlistId=playlist_id,
+            maxResults=50,
+        )
+        while request_page is not None:
+            response = request_page.execute()
+            for item in response.get("items", []):
+                video_id = (item.get("contentDetails") or {}).get("videoId")
+                if not video_id:
+                    continue
+                try:
+                    youtube.playlistItems().insert(
+                        part="snippet",
+                        body={
+                            "snippet": {
+                                "playlistId": target_id,
+                                "resourceId": {
+                                    "kind": "youtube#video",
+                                    "videoId": video_id,
+                                },
+                            }
+                        },
+                    ).execute()
+                    added += 1
+                except Exception as exc:
+                    failures.append({"playlist_id": playlist_id, "video_id": video_id, "error": str(exc)})
+            request_page = youtube.playlistItems().list_next(request_page, response)
+
+    for playlist_id in source_ids:
+        try:
+            youtube.playlists().delete(id=playlist_id).execute()
+        except Exception as exc:
+            failures.append({"playlist_id": playlist_id, "error": str(exc)})
+
+    try:
+        youtube.playlists().update(
+            part="snippet",
+            body={"id": target_id, "snippet": {"title": new_name}},
+        ).execute()
+    except Exception as exc:
+        failures.append({"playlist_id": target_id, "error": str(exc)})
+
+    return {"success": len(failures) == 0, "failures": failures, "added": added}
+
+
 @app.route("/login")
 def login():
     error_message = get_client_secrets_error()
