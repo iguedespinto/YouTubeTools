@@ -136,8 +136,18 @@ def load_saved_credentials():
 
 def save_credentials(credentials):
     try:
+        existing = load_saved_credentials() or {}
+        data = credentials_to_dict(credentials)
+        if not data.get("refresh_token") and existing.get("refresh_token"):
+            data["refresh_token"] = existing.get("refresh_token")
+        if not data.get("token_uri") and existing.get("token_uri"):
+            data["token_uri"] = existing.get("token_uri")
+        if not data.get("client_id") and existing.get("client_id"):
+            data["client_id"] = existing.get("client_id")
+        if not data.get("client_secret") and existing.get("client_secret"):
+            data["client_secret"] = existing.get("client_secret")
         with open(TOKEN_FILE, "w", encoding="utf-8") as token_file:
-            json.dump(credentials_to_dict(credentials), token_file)
+            json.dump(data, token_file)
     except OSError:
         return
 
@@ -323,10 +333,12 @@ def merge_playlists():
     payload = request.get_json(silent=True) or {}
     target_id = payload.get("target_id")
     source_ids = payload.get("source_ids") or []
-    new_name = (payload.get("new_name") or "").strip()
+    new_name = payload.get("new_name")
+    if new_name is not None:
+        new_name = str(new_name).strip()
     if not target_id or not isinstance(source_ids, list) or len(source_ids) < 1:
         return {"error": "Invalid playlist selection"}, 400
-    if not new_name:
+    if new_name is not None and not new_name:
         return {"error": "New name is required"}, 400
     normalized = normalize_saved_credentials(credentials) or credentials
     creds = Credentials(**normalized)
@@ -373,13 +385,14 @@ def merge_playlists():
         except Exception as exc:
             failures.append({"playlist_id": playlist_id, "error": str(exc)})
 
-    try:
-        youtube.playlists().update(
-            part="snippet",
-            body={"id": target_id, "snippet": {"title": new_name}},
-        ).execute()
-    except Exception as exc:
-        failures.append({"playlist_id": target_id, "error": str(exc)})
+    if new_name:
+        try:
+            youtube.playlists().update(
+                part="snippet",
+                body={"id": target_id, "snippet": {"title": new_name}},
+            ).execute()
+        except Exception as exc:
+            failures.append({"playlist_id": target_id, "error": str(exc)})
 
     return {"success": len(failures) == 0, "failures": failures, "added": added}
 

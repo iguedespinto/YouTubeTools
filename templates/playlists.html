@@ -337,7 +337,7 @@
     }
 
     if (mergeSelectedButton) {
-      mergeSelectedButton.addEventListener('click', () => {
+      mergeSelectedButton.addEventListener('click', async () => {
         const selected = Array.from(document.querySelectorAll('.playlist-select:checked'))
           .map((checkbox) => checkbox.closest('li'))
           .filter(Boolean);
@@ -356,52 +356,59 @@
         mergeSelectedButton.disabled = true;
         const originalLabel = mergeSelectedButton.textContent;
         mergeSelectedButton.textContent = 'Merging...';
+        const totalToTransfer = sources.reduce((sum, item) => sum + (item.count || 0), 0);
+        let transferred = 0;
         if (mergeStatus) {
-          mergeStatus.textContent = `Migrating: 0 of ${sources.length}`;
+          mergeStatus.textContent = `Transferring: ${transferred} of ${totalToTransfer}`;
         }
-        fetch('/merge-playlists', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Requested-With': 'XMLHttpRequest',
-          },
-          body: JSON.stringify({
-            target_id: target.id,
-            source_ids: sources.map((item) => item.id),
-            new_name: newName,
-          }),
-        })
-          .then((response) => response.json())
-          .then((data) => {
+        let hasFailures = false;
+        for (let i = 0; i < sources.length; i += 1) {
+          const source = sources[i];
+          const isLast = i === sources.length - 1;
+          try {
+            const response = await fetch('/merge-playlists', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+              },
+              body: JSON.stringify({
+                target_id: target.id,
+                source_ids: [source.id],
+                new_name: isLast ? newName : null,
+              }),
+            });
+            const data = await response.json();
             if (!data.success && data.failures && data.failures.length) {
-              alert('Some playlists could not be merged.');
+              hasFailures = true;
             }
-            sources.forEach((item) => item.li.remove());
-            const titleEl = target.li.querySelector('.playlist-link');
-            if (titleEl) titleEl.textContent = newName;
-            const newCount = sorted.reduce((sum, item) => sum + (item.count || 0), 0);
-            target.li.dataset.count = `${newCount}`;
-            const metaEl = target.li.querySelector('.meta');
-            if (metaEl) metaEl.textContent = `${newCount} videos`;
-            const checkbox = target.li.querySelector('.playlist-select');
-            if (checkbox) checkbox.checked = false;
-            if (mergeStatus) {
-              mergeStatus.textContent = `Migrating: ${sources.length} of ${sources.length}`;
-            }
-            updateBulkState();
-          })
-          .catch(() => {
-            alert('Failed to merge playlists.');
-          })
-          .finally(() => {
-            mergeSelectedButton.textContent = originalLabel;
-            if (mergeStatus) {
-              setTimeout(() => {
-                mergeStatus.textContent = '';
-              }, 1500);
-            }
-            updateBulkState();
-          });
+            source.li.remove();
+          } catch {
+            hasFailures = true;
+          }
+          transferred += source.count || 0;
+          if (mergeStatus) {
+            mergeStatus.textContent = `Transferring: ${transferred} of ${totalToTransfer}`;
+          }
+        }
+        if (hasFailures) {
+          alert('Some playlists could not be merged.');
+        }
+        const titleEl = target.li.querySelector('.playlist-link');
+        if (titleEl) titleEl.textContent = newName;
+        const newCount = sorted.reduce((sum, item) => sum + (item.count || 0), 0);
+        target.li.dataset.count = `${newCount}`;
+        const metaEl = target.li.querySelector('.meta');
+        if (metaEl) metaEl.textContent = `${newCount} videos`;
+        const checkbox = target.li.querySelector('.playlist-select');
+        if (checkbox) checkbox.checked = false;
+        mergeSelectedButton.textContent = originalLabel;
+        if (mergeStatus) {
+          setTimeout(() => {
+            mergeStatus.textContent = '';
+          }, 1500);
+        }
+        updateBulkState();
       });
     }
   </script>
