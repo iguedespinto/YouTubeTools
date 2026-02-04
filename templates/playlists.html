@@ -5,7 +5,13 @@
   <div class="actions">
     <a class="btn secondary" href="{{ url_for('logout') }}">Disconnect</a>
   </div>
-  <div class="meta">Total playlists: {{ total_playlists }} · Total videos: {{ total_videos }}</div>
+  <div class="meta">
+    Total playlists: {{ total_playlists }} · Total videos: {{ total_videos }}
+    · API calls used (session): {{ api_calls_used }}
+    {% if api_calls_remaining is not none %}
+      · Estimated remaining: {{ api_calls_remaining }}
+    {% endif %}
+  </div>
   <form method="get">
     <div class="actions">
       <label>
@@ -43,7 +49,7 @@
       <div class="playlist-list-pane">
         <div class="bulk-actions actions">
           <button class="btn danger" type="button" id="delete-selected" style="display: none;" disabled>Delete selected</button>
-          <button class="btn secondary" type="button" id="merge-selected" style="display: none;" disabled>Merge selected</button>
+          <button class="btn secondary" type="button" id="merge-selected" style="display: none;" disabled onclick="document.getElementById('merge-status').textContent='Merge button clicked.'; startMerge(event);">Merge selected</button>
           <span id="merge-status" class="merge-status"></span>
         </div>
         <ul class="playlist-list" id="playlist-list">
@@ -372,80 +378,89 @@
       });
     }
 
-    if (mergeSelectedButton) {
-      mergeSelectedButton.addEventListener('click', async () => {
-        const selected = Array.from(document.querySelectorAll('.playlist-select:checked'))
-          .map((checkbox) => checkbox.closest('li'))
-          .filter(Boolean);
-        if (selected.length < 2) return;
-        const newName = prompt('New playlist name');
-        if (!newName) return;
-        const sorted = selected
-          .map((li) => ({
-            li,
-            id: li.dataset.playlistId,
-            count: parseInt(li.dataset.count || '0', 10),
-          }))
-          .sort((a, b) => b.count - a.count);
-        const target = sorted[0];
-        const sources = sorted.slice(1);
-        mergeSelectedButton.disabled = true;
-        const originalLabel = mergeSelectedButton.textContent;
-        mergeSelectedButton.textContent = 'Merging...';
-        const totalToTransfer = sources.reduce((sum, item) => sum + (item.count || 0), 0);
-        let transferred = 0;
+    async function startMerge(event) {
+      if (event) {
+        event.preventDefault();
+      }
+      if (mergeStatus) {
+        mergeStatus.textContent = 'Merge button clicked.';
+      }
+      const selected = Array.from(document.querySelectorAll('.playlist-select:checked'))
+        .map((checkbox) => checkbox.closest('li'))
+        .filter(Boolean);
+      if (selected.length < 2) {
+        alert('Select at least two playlists to merge.');
+        return;
+      }
+      const sorted = selected
+        .map((li) => ({
+          li,
+          id: li.dataset.playlistId,
+          count: parseInt(li.dataset.count || '0', 10),
+        }))
+        .sort((a, b) => b.count - a.count);
+      const target = sorted[0];
+      const sources = sorted.slice(1);
+      mergeSelectedButton.disabled = true;
+      const originalLabel = mergeSelectedButton.textContent;
+      mergeSelectedButton.textContent = 'Merging...';
+      const totalToTransfer = sources.reduce((sum, item) => sum + (item.count || 0), 0);
+      let transferred = 0;
+      if (mergeStatus) {
+        mergeStatus.textContent = `Transferring: ${transferred} of ${totalToTransfer}`;
+      }
+      let hasFailures = false;
+      for (let i = 0; i < sources.length; i += 1) {
+        const source = sources[i];
+        const isLast = i === sources.length - 1;
+        try {
+          const response = await fetch('/merge-playlists', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Requested-With': 'XMLHttpRequest',
+            },
+            body: JSON.stringify({
+              target_id: target.id,
+              source_ids: [source.id],
+              new_name: null,
+            }),
+          });
+          const data = await response.json();
+          if (!data.success && data.failures && data.failures.length) {
+            hasFailures = true;
+          }
+          source.li.remove();
+        } catch {
+          hasFailures = true;
+        }
+        transferred += source.count || 0;
         if (mergeStatus) {
           mergeStatus.textContent = `Transferring: ${transferred} of ${totalToTransfer}`;
         }
-        let hasFailures = false;
-        for (let i = 0; i < sources.length; i += 1) {
-          const source = sources[i];
-          const isLast = i === sources.length - 1;
-          try {
-            const response = await fetch('/merge-playlists', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'X-Requested-With': 'XMLHttpRequest',
-              },
-              body: JSON.stringify({
-                target_id: target.id,
-                source_ids: [source.id],
-                new_name: isLast ? newName : null,
-              }),
-            });
-            const data = await response.json();
-            if (!data.success && data.failures && data.failures.length) {
-              hasFailures = true;
-            }
-            source.li.remove();
-          } catch {
-            hasFailures = true;
-          }
-          transferred += source.count || 0;
-          if (mergeStatus) {
-            mergeStatus.textContent = `Transferring: ${transferred} of ${totalToTransfer}`;
-          }
-        }
-        if (hasFailures) {
-          alert('Some playlists could not be merged.');
-        }
-        const titleEl = target.li.querySelector('.playlist-link');
-        if (titleEl) titleEl.textContent = newName;
-        const newCount = sorted.reduce((sum, item) => sum + (item.count || 0), 0);
-        target.li.dataset.count = `${newCount}`;
-        const metaEl = target.li.querySelector('.meta');
-        if (metaEl) metaEl.textContent = `${newCount} videos`;
-        const checkbox = target.li.querySelector('.playlist-select');
-        if (checkbox) checkbox.checked = false;
-        mergeSelectedButton.textContent = originalLabel;
-        if (mergeStatus) {
-          setTimeout(() => {
-            mergeStatus.textContent = '';
-          }, 1500);
-        }
-        updateBulkState();
-      });
+      }
+      if (hasFailures) {
+        alert('Some playlists could not be merged.');
+      }
+      const newCount = sorted.reduce((sum, item) => sum + (item.count || 0), 0);
+      target.li.dataset.count = `${newCount}`;
+      const metaEl = target.li.querySelector('.meta');
+      if (metaEl) metaEl.textContent = `${newCount} videos`;
+      const checkbox = target.li.querySelector('.playlist-select');
+      if (checkbox) checkbox.checked = false;
+      mergeSelectedButton.textContent = originalLabel;
+      if (mergeStatus) {
+        mergeStatus.textContent = 'Merge complete.';
+        setTimeout(() => {
+          mergeStatus.textContent = '';
+        }, 1500);
+      }
+      updateBulkState();
     }
+
+    if (mergeSelectedButton) {
+      mergeSelectedButton.addEventListener('click', startMerge);
+    }
+    window.startMerge = startMerge;
   </script>
 {% endblock %}

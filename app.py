@@ -30,6 +30,8 @@ TOKEN_FILE = (
     or os.getenv("TOKEN_FILE")
     or "token.json"
 )
+API_CALL_QUOTA = os.getenv("YT_API_CALLS_QUOTA")
+API_CALL_COUNT = 0
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_secret_key_change_me")
@@ -47,6 +49,11 @@ def credentials_to_dict(credentials):
     if credentials.expiry:
         data["expiry"] = credentials.expiry.isoformat()
     return data
+
+
+def record_api_call(count=1):
+    global API_CALL_COUNT
+    API_CALL_COUNT += count
 
 
 def get_flow(state=None):
@@ -167,6 +174,7 @@ def get_playlists(credentials_dict):
     )
     while request_page is not None:
         response = request_page.execute()
+        record_api_call()
         playlists.extend(response.get("items", []))
         request_page = youtube.playlists().list_next(request_page, response)
     return playlists
@@ -207,6 +215,13 @@ def index():
         (item.get("contentDetails", {}).get("itemCount", 0) or 0)
         for item in playlists
     )
+    try:
+        quota = int(API_CALL_QUOTA) if API_CALL_QUOTA else None
+    except ValueError:
+        quota = None
+    api_calls_remaining = None
+    if quota is not None:
+        api_calls_remaining = max(quota - API_CALL_COUNT, 0)
     return render_template(
         "playlists.html",
         playlists=playlists,
@@ -214,6 +229,8 @@ def index():
         sort_order=sort_order,
         total_playlists=total_playlists,
         total_videos=total_videos,
+        api_calls_used=API_CALL_COUNT,
+        api_calls_remaining=api_calls_remaining,
     )
 
 
@@ -230,6 +247,7 @@ def delete_playlist(playlist_id):
     youtube = build("youtube", "v3", credentials=creds)
     try:
         youtube.playlists().delete(id=playlist_id).execute()
+        record_api_call()
     except Exception as exc:
         if request.headers.get("X-Requested-With") == "XMLHttpRequest":
             return {"error": str(exc)}, 400
@@ -260,6 +278,7 @@ def delete_bulk():
     for playlist_id in playlist_ids:
         try:
             youtube.playlists().delete(id=playlist_id).execute()
+            record_api_call()
         except Exception as exc:
             failures.append({"id": playlist_id, "error": str(exc)})
     return {"success": len(failures) == 0, "failures": failures}
@@ -284,6 +303,7 @@ def playlist_items(playlist_id):
     )
     while request_page is not None:
         response = request_page.execute()
+        record_api_call()
         items.extend(response.get("items", []))
         request_page = youtube.playlistItems().list_next(request_page, response)
     simplified = []
@@ -320,6 +340,7 @@ def delete_playlist_items_bulk(playlist_id):
     for item_id in item_ids:
         try:
             youtube.playlistItems().delete(id=item_id).execute()
+            record_api_call()
         except Exception as exc:
             failures.append({"id": item_id, "error": str(exc)})
     return {"success": len(failures) == 0, "failures": failures}
@@ -357,6 +378,7 @@ def merge_playlists():
         )
         while request_page is not None:
             response = request_page.execute()
+            record_api_call()
             for item in response.get("items", []):
                 video_id = (item.get("contentDetails") or {}).get("videoId")
                 if not video_id:
@@ -374,6 +396,7 @@ def merge_playlists():
                             }
                         },
                     ).execute()
+                    record_api_call()
                     added += 1
                 except Exception as exc:
                     failures.append({"playlist_id": playlist_id, "video_id": video_id, "error": str(exc)})
@@ -382,6 +405,7 @@ def merge_playlists():
     for playlist_id in source_ids:
         try:
             youtube.playlists().delete(id=playlist_id).execute()
+            record_api_call()
         except Exception as exc:
             failures.append({"playlist_id": playlist_id, "error": str(exc)})
 
@@ -391,6 +415,7 @@ def merge_playlists():
                 part="snippet",
                 body={"id": target_id, "snippet": {"title": new_name}},
             ).execute()
+            record_api_call()
         except Exception as exc:
             failures.append({"playlist_id": target_id, "error": str(exc)})
 
