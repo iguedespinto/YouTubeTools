@@ -398,6 +398,74 @@ def delete_playlist_items_bulk(playlist_id):
     return {"success": len(failures) == 0, "failures": failures}
 
 
+@app.route("/playlist/<playlist_id>/items/transfer", methods=["POST"])
+def transfer_playlist_items(playlist_id):
+    credentials = session.get("credentials") or load_saved_credentials()
+    if not credentials:
+        return {"error": "Not authenticated"}, 401
+    payload = request.get_json(silent=True) or {}
+    destination_id = payload.get("destination_id")
+    items = payload.get("items") or []
+    mode = payload.get("mode") or "copy"
+    if mode not in {"copy", "move"}:
+        return {"error": "Invalid transfer mode"}, 400
+    if not destination_id:
+        return {"error": "Destination playlist is required"}, 400
+    if not isinstance(items, list) or not items:
+        return {"error": "No items provided"}, 400
+    normalized = normalize_saved_credentials(credentials) or credentials
+    creds = Credentials(**normalized)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        save_credentials(creds)
+    youtube = build("youtube", "v3", credentials=creds)
+    failures = []
+    added = 0
+    delete_after = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        video_id = item.get("videoId")
+        playlist_item_id = item.get("playlistItemId")
+        if not video_id:
+            failures.append({"videoId": video_id, "error": "Missing videoId"})
+            continue
+        try:
+            youtube.playlistItems().insert(
+                part="snippet",
+                body={
+                    "snippet": {
+                        "playlistId": destination_id,
+                        "resourceId": {
+                            "kind": "youtube#video",
+                            "videoId": video_id,
+                        },
+                    }
+                },
+            ).execute()
+            record_api_call()
+            added += 1
+            if mode == "move" and playlist_item_id:
+                delete_after.append(playlist_item_id)
+        except Exception as exc:
+            failures.append({"videoId": video_id, "error": str(exc)})
+    removed = 0
+    if mode == "move" and delete_after:
+        for item_id in delete_after:
+            try:
+                youtube.playlistItems().delete(id=item_id).execute()
+                record_api_call()
+                removed += 1
+            except Exception as exc:
+                failures.append({"id": item_id, "error": str(exc)})
+    return {
+        "success": len(failures) == 0,
+        "added": added,
+        "removed": removed,
+        "failures": failures,
+    }
+
+
 @app.route("/merge-playlists", methods=["POST"])
 def merge_playlists():
     credentials = session.get("credentials") or load_saved_credentials()

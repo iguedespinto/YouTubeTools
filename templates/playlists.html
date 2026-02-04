@@ -88,7 +88,17 @@
             <div id="playlist-viewer-title">Playlist videos</div>
             <div id="playlist-viewer-status" class="viewer-status"></div>
           </div>
-          <button class="btn danger" type="button" id="delete-selected-videos" disabled>Delete selected videos</button>
+          <div class="viewer-actions">
+            <label>
+              Destination
+              <select id="transfer-destination" disabled>
+                <option value="">Select playlist</option>
+              </select>
+            </label>
+            <button class="btn secondary" type="button" id="copy-selected-videos" disabled>Copy selected</button>
+            <button class="btn secondary" type="button" id="move-selected-videos" disabled>Move selected</button>
+            <button class="btn danger" type="button" id="delete-selected-videos" disabled>Delete selected videos</button>
+          </div>
         </div>
         <div id="playlist-viewer" class="viewer-list">
           <div class="viewer-hint">Select a playlist to load its videos.</div>
@@ -113,12 +123,42 @@
     const viewerTitle = document.getElementById('playlist-viewer-title');
     const viewerStatus = document.getElementById('playlist-viewer-status');
     const deleteSelectedVideosButton = document.getElementById('delete-selected-videos');
+    const copySelectedVideosButton = document.getElementById('copy-selected-videos');
+    const moveSelectedVideosButton = document.getElementById('move-selected-videos');
+    const transferDestinationSelect = document.getElementById('transfer-destination');
     let currentPlaylistId = null;
 
     function updateVideoDeleteState() {
       if (!deleteSelectedVideosButton) return;
       const anySelected = viewer.querySelectorAll('.video-select:checked').length > 0;
       deleteSelectedVideosButton.disabled = !anySelected;
+    }
+
+    function updateTransferState() {
+      if (!copySelectedVideosButton || !moveSelectedVideosButton || !transferDestinationSelect) return;
+      const anySelected = viewer.querySelectorAll('.video-select:checked').length > 0;
+      const hasDestination = Boolean(transferDestinationSelect.value);
+      copySelectedVideosButton.disabled = !anySelected || !hasDestination;
+      moveSelectedVideosButton.disabled = !anySelected || !hasDestination;
+    }
+
+    function updateDestinationOptions() {
+      if (!transferDestinationSelect) return;
+      const options = Array.from(document.querySelectorAll('.playlist-list li'))
+        .map((row) => {
+          const title = row.querySelector('.playlist-link')?.textContent?.trim() || '';
+          return { id: row.dataset.playlistId, title };
+        })
+        .filter((item) => item.id && item.id !== currentPlaylistId);
+      transferDestinationSelect.innerHTML = '<option value="">Select playlist</option>';
+      options.forEach((item) => {
+        const option = document.createElement('option');
+        option.value = item.id;
+        option.textContent = item.title;
+        transferDestinationSelect.appendChild(option);
+      });
+      transferDestinationSelect.disabled = options.length === 0;
+      updateTransferState();
     }
 
     function loadPlaylistVideos(playlistId, playlistTitle, rowElement) {
@@ -136,6 +176,7 @@
       if (rowElement) {
         rowElement.classList.add('active');
       }
+      updateDestinationOptions();
       viewer.innerHTML = '<div class="viewer-hint">Loading...</div>';
       fetch(`/playlist/${playlistId}/items`)
         .then((response) => response.json())
@@ -153,6 +194,7 @@
             const playlistItemId = item?.playlistItemId;
             const listItem = document.createElement('li');
             listItem.dataset.playlistItemId = playlistItemId || '';
+            listItem.dataset.videoId = videoId || '';
             const link = document.createElement('a');
             const thumb = document.createElement('img');
             const checkbox = document.createElement('input');
@@ -169,7 +211,10 @@
               link.target = '_blank';
               link.rel = 'noopener noreferrer';
             }
-            checkbox.addEventListener('change', updateVideoDeleteState);
+            checkbox.addEventListener('change', () => {
+              updateVideoDeleteState();
+              updateTransferState();
+            });
             listItem.appendChild(checkbox);
             listItem.appendChild(thumb);
             listItem.appendChild(link);
@@ -178,6 +223,7 @@
           viewer.innerHTML = '';
           viewer.appendChild(list);
           updateVideoDeleteState();
+          updateTransferState();
         })
         .catch(() => {
           viewer.innerHTML = '<div class="viewer-hint">Failed to load videos.</div>';
@@ -297,20 +343,48 @@
       });
     }
 
+    function collectSelectedVideoItems() {
+      return Array.from(viewer.querySelectorAll('.video-select:checked'))
+        .map((checkbox) => checkbox.closest('li'))
+        .filter(Boolean)
+        .map((li) => ({
+          li,
+          playlistItemId: li.dataset.playlistItemId,
+          videoId: li.dataset.videoId,
+        }));
+    }
+
+    function updatePlaylistCount(playlistId, delta) {
+      if (!playlistId || !Number.isFinite(delta)) return;
+      const row = document.querySelector(`.playlist-list li[data-playlist-id="${playlistId}"]`);
+      if (!row) return;
+      const current = parseInt(row.dataset.count || '0', 10);
+      if (Number.isNaN(current)) return;
+      const next = Math.max(current + delta, 0);
+      row.dataset.count = `${next}`;
+      const metaEl = row.querySelector('.meta');
+      if (metaEl) metaEl.textContent = `${next} videos`;
+    }
+
+    function updateTotalVideos(delta) {
+      if (!totalVideosEl || !Number.isFinite(delta)) return;
+      const currentTotal = parseInt(totalVideosEl.textContent || '0', 10);
+      if (Number.isNaN(currentTotal)) return;
+      totalVideosEl.textContent = `${Math.max(currentTotal + delta, 0)}`;
+    }
+
     if (deleteSelectedVideosButton) {
       deleteSelectedVideosButton.addEventListener('click', () => {
-        const selected = Array.from(viewer.querySelectorAll('.video-select:checked'))
-          .map((checkbox) => checkbox.closest('li'))
-          .filter(Boolean);
-        if (!selected.length || !currentPlaylistId) return;
-        if (!confirm(`Remove ${selected.length} video(s) from this playlist?`)) return;
+        const selectedItems = collectSelectedVideoItems();
+        if (!selectedItems.length || !currentPlaylistId) return;
+        if (!confirm(`Remove ${selectedItems.length} video(s) from this playlist?`)) return;
         deleteSelectedVideosButton.disabled = true;
         const originalLabel = deleteSelectedVideosButton.textContent;
         deleteSelectedVideosButton.textContent = 'Deleting...';
         if (viewerStatus) {
-          viewerStatus.textContent = `Removing: 0 of ${selected.length}`;
+          viewerStatus.textContent = `Removing: 0 of ${selectedItems.length}`;
         }
-        const itemIds = selected.map((li) => li.dataset.playlistItemId).filter(Boolean);
+        const itemIds = selectedItems.map((item) => item.playlistItemId).filter(Boolean);
         fetch(`/playlist/${currentPlaylistId}/items/delete-bulk`, {
           method: 'POST',
           headers: {
@@ -323,19 +397,25 @@
           .then((data) => {
             if (!data.success && data.failures && data.failures.length) {
               const failedIds = new Set(data.failures.map((item) => item.id));
-              selected.forEach((li) => {
-                if (!failedIds.has(li.dataset.playlistItemId)) {
-                  li.remove();
+              selectedItems.forEach((item) => {
+                if (!failedIds.has(item.playlistItemId)) {
+                  item.li.remove();
                 }
               });
               alert('Some videos could not be removed.');
             } else {
-              selected.forEach((li) => li.remove());
+              selectedItems.forEach((item) => item.li.remove());
             }
             if (viewerStatus) {
-              viewerStatus.textContent = `Removing: ${selected.length} of ${selected.length}`;
+              viewerStatus.textContent = `Removing: ${selectedItems.length} of ${selectedItems.length}`;
             }
+            const removedCount = data.failures && data.failures.length
+              ? selectedItems.length - data.failures.length
+              : selectedItems.length;
+            updatePlaylistCount(currentPlaylistId, -removedCount);
+            updateTotalVideos(-removedCount);
             updateVideoDeleteState();
+            updateTransferState();
           })
           .catch(() => {
             alert('Failed to remove videos.');
@@ -348,8 +428,93 @@
               }, 1500);
             }
             updateVideoDeleteState();
+            updateTransferState();
           });
       });
+    }
+
+    if (transferDestinationSelect) {
+      transferDestinationSelect.addEventListener('change', updateTransferState);
+    }
+
+    function handleTransfer(mode) {
+      const selectedItems = collectSelectedVideoItems();
+      if (!selectedItems.length || !currentPlaylistId) return;
+      const destinationId = transferDestinationSelect?.value;
+      if (!destinationId) return;
+      const actionLabel = mode === 'move' ? 'Move' : 'Copy';
+      if (!confirm(`${actionLabel} ${selectedItems.length} video(s) to the selected playlist?`)) return;
+      const button = mode === 'move' ? moveSelectedVideosButton : copySelectedVideosButton;
+      if (!button) return;
+      button.disabled = true;
+      const originalLabel = button.textContent;
+      button.textContent = `${actionLabel}ing...`;
+      if (viewerStatus) {
+        viewerStatus.textContent = `${actionLabel}ing: 0 of ${selectedItems.length}`;
+      }
+      const payloadItems = selectedItems.map((item) => ({
+        videoId: item.videoId,
+        playlistItemId: item.playlistItemId,
+      }));
+      fetch(`/playlist/${currentPlaylistId}/items/transfer`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'XMLHttpRequest',
+        },
+        body: JSON.stringify({
+          destination_id: destinationId,
+          items: payloadItems,
+          mode,
+        }),
+      })
+        .then((response) => response.json())
+        .then((data) => {
+          if (!data.success && data.failures && data.failures.length) {
+            alert('Some videos could not be transferred.');
+          }
+          const added = data.added || 0;
+          const removed = data.removed || 0;
+          if (mode === 'move' && removed) {
+            selectedItems.forEach((item) => {
+              if (item.playlistItemId) {
+                item.li.remove();
+              }
+            });
+            updatePlaylistCount(currentPlaylistId, -removed);
+            updateTotalVideos(-removed);
+          }
+          if (added) {
+            updatePlaylistCount(destinationId, added);
+            if (mode === 'copy') {
+              updateTotalVideos(added);
+            }
+          }
+          if (viewerStatus) {
+            viewerStatus.textContent = `${actionLabel}ing: ${selectedItems.length} of ${selectedItems.length}`;
+            setTimeout(() => {
+              viewerStatus.textContent = '';
+            }, 1500);
+          }
+          updateVideoDeleteState();
+          updateTransferState();
+        })
+        .catch(() => {
+          alert('Failed to transfer videos.');
+        })
+        .finally(() => {
+          button.textContent = originalLabel;
+          button.disabled = false;
+          updateVideoDeleteState();
+          updateTransferState();
+        });
+    }
+
+    if (copySelectedVideosButton) {
+      copySelectedVideosButton.addEventListener('click', () => handleTransfer('copy'));
+    }
+    if (moveSelectedVideosButton) {
+      moveSelectedVideosButton.addEventListener('click', () => handleTransfer('move'));
     }
 
     document.querySelectorAll('.delete-form').forEach((form) => {
