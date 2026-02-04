@@ -6,7 +6,7 @@
     <a class="btn secondary" href="{{ url_for('logout') }}">Disconnect</a>
   </div>
   <div class="meta">
-    Total playlists: {{ total_playlists }} · Total videos: {{ total_videos }}
+    Total playlists: {{ total_playlists }} · Total videos: <span id="total-videos">{{ total_videos }}</span>
     · API calls used (session): {{ api_calls_used }}
     {% if api_calls_remaining is not none %}
       · Estimated remaining: {{ api_calls_remaining }}
@@ -62,6 +62,10 @@
               <button class="btn secondary view-button" type="button" data-playlist-id="{{ playlist.id }}">
                 View
               </button>
+              <button class="btn secondary dedupe-button" type="button" data-playlist-id="{{ playlist.id }}">
+                Dedupe
+              </button>
+              <span class="dedupe-status" aria-live="polite"></span>
               <div class="playlist-info">
                 <div>
                   <strong>
@@ -102,6 +106,7 @@
     const mergeStatus = document.getElementById('merge-status');
     const playlistSearch = document.getElementById('playlist-search');
     const playlistList = document.getElementById('playlist-list');
+    const totalVideosEl = document.getElementById('total-videos');
     let searchTimer = null;
     const countInput = document.getElementById('count-threshold');
 
@@ -184,6 +189,80 @@
         const li = button.closest('li');
         const title = li ? li.querySelector('.playlist-link')?.textContent?.trim() : '';
         loadPlaylistVideos(button.dataset.playlistId, title, li);
+      });
+    });
+
+    document.querySelectorAll('.dedupe-button').forEach((button) => {
+      button.addEventListener('click', () => {
+        const li = button.closest('li');
+        const playlistId = li?.dataset.playlistId || button.dataset.playlistId;
+        if (!playlistId) return;
+        if (!confirm('Remove duplicate videos from this playlist?')) return;
+        const statusEl = li ? li.querySelector('.dedupe-status') : null;
+        button.disabled = true;
+        const originalLabel = button.textContent;
+        button.textContent = 'Removing...';
+        if (statusEl) {
+          statusEl.textContent = 'Removing duplicates...';
+          statusEl.classList.remove('error');
+        }
+        fetch(`/playlist/${playlistId}/dedupe`, {
+          method: 'POST',
+          headers: { 'X-Requested-With': 'XMLHttpRequest' },
+        })
+          .then((response) => response.json())
+          .then((data) => {
+            if (!data.success) {
+              if (statusEl) {
+                statusEl.textContent = data.error || 'Failed to remove duplicates.';
+                statusEl.classList.add('error');
+              } else {
+                alert(data.error || 'Failed to remove duplicates.');
+              }
+              return;
+            }
+            const remaining = data.remaining;
+            if (li && Number.isFinite(remaining)) {
+              li.dataset.count = `${remaining}`;
+              const metaEl = li.querySelector('.meta');
+              if (metaEl) metaEl.textContent = `${remaining} videos`;
+            }
+            const removedCount = data.removed || 0;
+            if (totalVideosEl && Number.isFinite(removedCount)) {
+              const currentTotal = parseInt(totalVideosEl.textContent || '0', 10);
+              if (!Number.isNaN(currentTotal)) {
+                totalVideosEl.textContent = `${Math.max(currentTotal - removedCount, 0)}`;
+              }
+            }
+            if (currentPlaylistId === playlistId) {
+              const title = li ? li.querySelector('.playlist-link')?.textContent?.trim() : '';
+              loadPlaylistVideos(playlistId, title, li);
+            }
+            if (statusEl) {
+              if (data.failures && data.failures.length) {
+                statusEl.textContent = `Removed ${removedCount} duplicate(s), but some failed.`;
+                statusEl.classList.add('error');
+              } else {
+                statusEl.textContent = `Removed ${removedCount} duplicate(s).`;
+              }
+              setTimeout(() => {
+                statusEl.textContent = '';
+                statusEl.classList.remove('error');
+              }, 2000);
+            }
+          })
+          .catch(() => {
+            if (statusEl) {
+              statusEl.textContent = 'Failed to remove duplicates.';
+              statusEl.classList.add('error');
+            } else {
+              alert('Failed to remove duplicates.');
+            }
+          })
+          .finally(() => {
+            button.textContent = originalLabel;
+            button.disabled = false;
+          });
       });
     });
 

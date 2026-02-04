@@ -321,6 +321,58 @@ def playlist_items(playlist_id):
     return {"items": simplified}
 
 
+@app.route("/playlist/<playlist_id>/dedupe", methods=["POST"])
+def dedupe_playlist(playlist_id):
+    credentials = session.get("credentials") or load_saved_credentials()
+    if not credentials:
+        return {"error": "Not authenticated"}, 401
+    normalized = normalize_saved_credentials(credentials) or credentials
+    creds = Credentials(**normalized)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        save_credentials(creds)
+    youtube = build("youtube", "v3", credentials=creds)
+    items = []
+    request_page = youtube.playlistItems().list(
+        part="contentDetails",
+        playlistId=playlist_id,
+        maxResults=50,
+    )
+    while request_page is not None:
+        response = request_page.execute()
+        record_api_call()
+        items.extend(response.get("items", []))
+        request_page = youtube.playlistItems().list_next(request_page, response)
+    seen_video_ids = set()
+    duplicate_item_ids = []
+    for item in items:
+        details = item.get("contentDetails") or {}
+        video_id = details.get("videoId")
+        playlist_item_id = item.get("id")
+        if not video_id or not playlist_item_id:
+            continue
+        if video_id in seen_video_ids:
+            duplicate_item_ids.append(playlist_item_id)
+        else:
+            seen_video_ids.add(video_id)
+    failures = []
+    for item_id in duplicate_item_ids:
+        try:
+            youtube.playlistItems().delete(id=item_id).execute()
+            record_api_call()
+        except Exception as exc:
+            failures.append({"id": item_id, "error": str(exc)})
+    removed_count = len(duplicate_item_ids) - len(failures)
+    remaining_count = len(items) - removed_count
+    return {
+        "success": len(failures) == 0,
+        "removed": removed_count,
+        "duplicates": len(duplicate_item_ids),
+        "remaining": remaining_count,
+        "failures": failures,
+    }
+
+
 @app.route("/playlist/<playlist_id>/items/delete-bulk", methods=["POST"])
 def delete_playlist_items_bulk(playlist_id):
     credentials = session.get("credentials") or load_saved_credentials()
