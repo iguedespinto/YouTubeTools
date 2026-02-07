@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <h1>Set Up YouTube OAuth</h1>
+  <p>This app needs OAuth client details once to authorize your account.</p>
+  <p>In Google Cloud Console, create an OAuth client and add this redirect URI:</p>
+  <p><strong>{{ redirect_uri }}</strong></p>
+
+  {% if error_message %}
+    <p class="error">{{ error_message }}</p>
+  {% endif %}
+
+  <form method="post">
+    <h3>Paste OAuth client JSON</h3>
+    <textarea name="client_secrets_json" rows="10" style="width: 100%; max-width: 900px;"></textarea>
+
+    <h3>Or enter client ID + secret</h3>
+    <div class="actions">
+      <input type="text" name="client_id" placeholder="Client ID">
+      <input type="text" name="client_secret" placeholder="Client Secret">
+    </div>
+
+    <div class="actions">
+      <button class="btn" type="submit">Save OAuth Settings</button>
+      <a class="btn secondary" href="{{ url_for('index') }}">Back</a>
+    </div>
+  </form>
+
+  <p class="meta">Saved to <strong>{{ secrets_filename }}</strong> on this machine.</p>
+{% endblock %}
