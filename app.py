@@ -324,20 +324,35 @@ def playlist_items(playlist_id):
     response = api_request.execute()
     record_api_call(endpoint="playlistItems.list", call_type="list")
     simplified = []
+    deleted_item_ids = []
     for item in response.get("items", []):
         snippet = item.get("snippet") or {}
         details = item.get("contentDetails") or {}
+        title = snippet.get("title") or ""
+        if title in ("Deleted video", "Private video"):
+            deleted_item_ids.append(item.get("id"))
+            continue
         simplified.append(
             {
                 "playlistItemId": item.get("id"),
                 "videoId": details.get("videoId"),
-                "title": snippet.get("title"),
+                "title": title,
                 "thumbnail": ((snippet.get("thumbnails") or {}).get("default") or {}).get("url"),
             }
         )
+    # Auto-remove deleted/private videos from the playlist in the background
+    removed_count = 0
+    for pid in deleted_item_ids:
+        try:
+            youtube.playlistItems().delete(id=pid).execute()
+            record_api_call(endpoint="playlistItems.delete", call_type="delete")
+            removed_count += 1
+        except Exception:
+            pass
     return {
         "items": simplified,
         "nextPageToken": response.get("nextPageToken"),
+        "autoRemoved": removed_count,
     }
 
 
@@ -580,9 +595,20 @@ def rename_playlist(playlist_id):
         save_credentials(creds)
     youtube = build("youtube", "v3", credentials=creds)
     try:
+        # Fetch existing snippet so we preserve description and other fields
+        existing = youtube.playlists().list(
+            part="snippet",
+            id=playlist_id,
+        ).execute()
+        record_api_call(endpoint="playlists.list", call_type="list")
+        items = existing.get("items", [])
+        if not items:
+            return {"error": "Playlist not found"}, 404
+        current_snippet = items[0].get("snippet", {})
+        current_snippet["title"] = new_name
         youtube.playlists().update(
             part="snippet",
-            body={"id": playlist_id, "snippet": {"title": new_name}},
+            body={"id": playlist_id, "snippet": current_snippet},
         ).execute()
         record_api_call(endpoint="playlists.update", call_type="update")
     except Exception as exc:

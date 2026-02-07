@@ -113,30 +113,40 @@
     <div id="import-modal-overlay" class="import-modal-overlay">
       <div class="import-modal">
         <h3>Import videos</h3>
-        <label>
-          Destination playlist
+        <div>
+          <label for="import-destination">Destination playlist</label>
           <select id="import-destination">
             {% for playlist in playlists %}
               <option value="{{ playlist.id }}">{{ playlist.snippet.title }}</option>
             {% endfor %}
           </select>
-        </label>
+        </div>
         <div style="margin-top: 12px;">
-          <label>
-            Paste YouTube URLs, video IDs, or CSV content:
-          </label>
+          <label for="import-textarea">Paste YouTube URLs, video IDs, or CSV content:</label>
           <textarea id="import-textarea" placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ&#10;https://youtu.be/abc123&#10;or paste Google Takeout CSV..."></textarea>
         </div>
         <div style="margin-top: 8px;">
-          <label>
-            Or upload a file (.csv, .txt):
-            <input type="file" id="import-file" accept=".csv,.txt">
-          </label>
+          <label>Or upload a file (.csv, .txt):</label>
+          <input type="file" id="import-file" accept=".csv,.txt" style="margin-top: 4px;">
         </div>
         <div id="import-status" class="import-status"></div>
         <div class="actions">
           <button class="btn" type="button" id="import-submit">Import</button>
           <button class="btn secondary" type="button" id="import-cancel">Cancel</button>
+        </div>
+      </div>
+    </div>
+    <div id="rename-modal-overlay" class="import-modal-overlay">
+      <div class="import-modal">
+        <h3>Rename playlist</h3>
+        <div>
+          <label for="rename-input">New name</label>
+          <input type="text" id="rename-input" placeholder="Enter playlist name">
+        </div>
+        <div id="rename-status" class="import-status"></div>
+        <div class="actions">
+          <button class="btn" type="button" id="rename-submit">Rename</button>
+          <button class="btn secondary" type="button" id="rename-cancel">Cancel</button>
         </div>
       </div>
     </div>
@@ -166,6 +176,7 @@
     const videoCache = {};
     let isLoadingMore = false;
     let scrollCleanup = null;
+    let isPrefetching = false;
 
     function createVideoListItem(item) {
       const title = item?.title || 'Untitled video';
@@ -220,9 +231,59 @@
       updateViewerInfo();
     }
 
+    function handleAutoRemoved(playlistId, data) {
+      const removed = data.autoRemoved || 0;
+      if (removed > 0) {
+        updatePlaylistCount(playlistId, -removed);
+        updateTotalVideos(-removed);
+        updateViewerInfo();
+      }
+    }
+
+    function prefetchNextPage(playlistId) {
+      const cached = videoCache[playlistId];
+      if (!cached || !cached.nextPageToken || isPrefetching) return;
+      if (cached.prefetchedItems) return; /* already prefetched */
+      isPrefetching = true;
+      fetch(`/playlist/${playlistId}/items?pageToken=${encodeURIComponent(cached.nextPageToken)}`)
+        .then((response) => response.json())
+        .then((data) => {
+          if (currentPlaylistId !== playlistId) return;
+          const c = videoCache[playlistId];
+          if (!c) return;
+          c.prefetchedItems = data.items || [];
+          c.prefetchedNextPageToken = data.nextPageToken || null;
+          handleAutoRemoved(playlistId, data);
+        })
+        .catch(() => { /* silently fail */ })
+        .finally(() => { isPrefetching = false; });
+    }
+
     function loadMoreVideos(playlistId) {
       const cached = videoCache[playlistId];
-      if (!cached || !cached.nextPageToken || isLoadingMore) return;
+      if (!cached || isLoadingMore) return;
+      /* If we have prefetched items, render them instantly */
+      if (cached.prefetchedItems) {
+        isLoadingMore = true;
+        const list = viewer.querySelector('.viewer-items');
+        const newItems = cached.prefetchedItems;
+        cached.items.push(...newItems);
+        cached.nextPageToken = cached.prefetchedNextPageToken;
+        delete cached.prefetchedItems;
+        delete cached.prefetchedNextPageToken;
+        if (list) {
+          newItems.forEach((item) => {
+            list.appendChild(createVideoListItem(item));
+          });
+        }
+        updateViewerInfo();
+        isLoadingMore = false;
+        /* Kick off prefetch of the next page */
+        prefetchNextPage(playlistId);
+        return;
+      }
+      /* No prefetched data available — fall back to fetch-then-render */
+      if (!cached.nextPageToken) return;
       isLoadingMore = true;
       const list = viewer.querySelector('.viewer-items');
       const loadingEl = document.createElement('div');
@@ -242,6 +303,9 @@
             });
           }
           updateViewerInfo();
+          handleAutoRemoved(playlistId, data);
+          /* Prefetch the next page */
+          prefetchNextPage(playlistId);
         })
         .catch(() => {
           /* silently fail, user can scroll again */
@@ -351,6 +415,7 @@
       if (videoCache[playlistId]) {
         renderCachedItems(playlistId);
         setupInfiniteScroll(playlistId);
+        prefetchNextPage(playlistId);
         return;
       }
 
@@ -366,6 +431,9 @@
           };
           renderCachedItems(playlistId);
           setupInfiniteScroll(playlistId);
+          handleAutoRemoved(playlistId, data);
+          /* Immediately prefetch second page so first view has 100 records ready */
+          prefetchNextPage(playlistId);
         })
         .catch(() => {
           viewer.innerHTML = '<div class="viewer-hint">Failed to load videos.</div>';
@@ -380,19 +448,74 @@
       });
     });
 
-    document.querySelectorAll('.rename-button').forEach((button) => {
-      button.addEventListener('click', () => {
-        const li = button.closest('li');
-        const playlistId = li?.dataset.playlistId || button.dataset.playlistId;
-        if (!playlistId) return;
-        const currentTitle = li?.querySelector('.playlist-link')?.textContent?.trim() || '';
-        const newName = prompt('New playlist name', currentTitle);
-        if (!newName) return;
-        const trimmed = newName.trim();
-        if (!trimmed) return;
-        button.disabled = true;
-        const originalLabel = button.textContent;
-        button.textContent = 'Renaming...';
+    /* ── Rename modal logic ── */
+    const renameModalOverlay = document.getElementById('rename-modal-overlay');
+    const renameInput = document.getElementById('rename-input');
+    const renameStatus = document.getElementById('rename-status');
+    const renameSubmitButton = document.getElementById('rename-submit');
+    const renameCancelButton = document.getElementById('rename-cancel');
+    let renameTargetPlaylistId = null;
+    let renameTargetLi = null;
+
+    function openRenameModal(playlistId, li) {
+      renameTargetPlaylistId = playlistId;
+      renameTargetLi = li;
+      const currentTitle = li?.querySelector('.playlist-link')?.textContent?.trim() || '';
+      if (renameInput) {
+        renameInput.value = currentTitle;
+      }
+      if (renameStatus) renameStatus.textContent = '';
+      if (renameModalOverlay) renameModalOverlay.classList.add('visible');
+      /* Focus and select text so user can type immediately */
+      setTimeout(() => {
+        if (renameInput) {
+          renameInput.focus();
+          renameInput.select();
+        }
+      }, 50);
+    }
+
+    function closeRenameModal() {
+      if (renameModalOverlay) renameModalOverlay.classList.remove('visible');
+      renameTargetPlaylistId = null;
+      renameTargetLi = null;
+    }
+
+    if (renameCancelButton) {
+      renameCancelButton.addEventListener('click', closeRenameModal);
+    }
+    if (renameModalOverlay) {
+      renameModalOverlay.addEventListener('click', (e) => {
+        if (e.target === renameModalOverlay) closeRenameModal();
+      });
+    }
+
+    /* Submit rename on Enter key */
+    if (renameInput) {
+      renameInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          if (renameSubmitButton) renameSubmitButton.click();
+        }
+      });
+    }
+
+    if (renameSubmitButton) {
+      renameSubmitButton.addEventListener('click', () => {
+        const trimmed = (renameInput ? renameInput.value : '').trim();
+        if (!trimmed) {
+          if (renameStatus) renameStatus.textContent = 'Name cannot be empty.';
+          return;
+        }
+        if (!renameTargetPlaylistId) return;
+        const playlistId = renameTargetPlaylistId;
+        const li = renameTargetLi;
+
+        renameSubmitButton.disabled = true;
+        const originalLabel = renameSubmitButton.textContent;
+        renameSubmitButton.textContent = 'Renaming...';
+        if (renameStatus) renameStatus.textContent = '';
+
         fetch(`/playlist/${playlistId}/rename`, {
           method: 'POST',
           headers: {
@@ -404,7 +527,7 @@
           .then((response) => response.json())
           .then((data) => {
             if (!data.success) {
-              alert(data.error || 'Failed to rename playlist.');
+              if (renameStatus) renameStatus.textContent = data.error || 'Failed to rename playlist.';
               return;
             }
             const link = li?.querySelector('.playlist-link');
@@ -416,14 +539,24 @@
               viewerTitle.textContent = `Playlist videos: ${data.name || trimmed}`;
             }
             updateDestinationOptions();
+            closeRenameModal();
           })
           .catch(() => {
-            alert('Failed to rename playlist.');
+            if (renameStatus) renameStatus.textContent = 'Failed to rename playlist.';
           })
           .finally(() => {
-            button.textContent = originalLabel;
-            button.disabled = false;
+            renameSubmitButton.textContent = originalLabel;
+            renameSubmitButton.disabled = false;
           });
+      });
+    }
+
+    document.querySelectorAll('.rename-button').forEach((button) => {
+      button.addEventListener('click', () => {
+        const li = button.closest('li');
+        const playlistId = li?.dataset.playlistId || button.dataset.playlistId;
+        if (!playlistId) return;
+        openRenameModal(playlistId, li);
       });
     });
 

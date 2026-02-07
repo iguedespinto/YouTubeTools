@@ -51,7 +51,12 @@
       .import-modal { background: #fff; border-radius: 8px; padding: 24px; max-width: 600px; width: 90%; max-height: 80vh; overflow: auto; }
       .import-modal h3 { margin-top: 0; }
       .import-modal textarea { width: 100%; height: 200px; font-family: monospace; font-size: 13px; padding: 8px; border: 1px solid #ccc; border-radius: 4px; resize: vertical; box-sizing: border-box; }
-      .import-modal .actions { margin-top: 12px; }
+      .import-modal label { display: block; font-size: 14px; color: #444; margin-bottom: 4px; }
+      .import-modal input[type="text"],
+      .import-modal select { width: 100%; box-sizing: border-box; padding: 10px 12px; font-size: 15px; border: 1px solid #ccc; border-radius: 6px; }
+      .import-modal input[type="text"]:focus,
+      .import-modal select:focus { outline: none; border-color: #1f6feb; box-shadow: 0 0 0 3px rgba(31,111,235,0.15); }
+      .import-modal .actions { margin-top: 16px; }
       .import-status { margin-top: 8px; color: #666; font-size: 14px; }
     </style>
   </head>
