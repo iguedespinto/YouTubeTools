@@ -232,13 +232,15 @@ def index():
         (item.get("contentDetails", {}).get("itemCount", 0) or 0)
         for item in playlists
     )
+    today_start_utc = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    api_calls_today = api_logs_collection.count_documents({"timestamp": {"$gte": today_start_utc}})
     try:
         quota = int(API_CALL_QUOTA) if API_CALL_QUOTA else None
     except ValueError:
         quota = None
     api_calls_remaining = None
     if quota is not None:
-        api_calls_remaining = max(quota - API_CALL_COUNT, 0)
+        api_calls_remaining = max(quota - api_calls_today, 0)
     return render_template(
         "playlists.html",
         playlists=playlists,
@@ -246,7 +248,7 @@ def index():
         sort_order=sort_order,
         total_playlists=total_playlists,
         total_videos=total_videos,
-        api_calls_used=API_CALL_COUNT,
+        api_calls_used=api_calls_today,
         api_calls_remaining=api_calls_remaining,
     )
 
