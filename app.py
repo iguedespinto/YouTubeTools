@@ -590,6 +590,46 @@ def rename_playlist(playlist_id):
     return {"success": True, "name": new_name}
 
 
+@app.route("/playlist/<playlist_id>/import", methods=["POST"])
+def import_videos(playlist_id):
+    credentials = session.get("credentials") or load_saved_credentials()
+    if not credentials:
+        return {"error": "Not authenticated"}, 401
+    payload = request.get_json(silent=True) or {}
+    video_ids = payload.get("video_ids") or []
+    if not isinstance(video_ids, list) or not video_ids:
+        return {"error": "No video IDs provided"}, 400
+    normalized = normalize_saved_credentials(credentials) or credentials
+    creds = Credentials(**normalized)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        save_credentials(creds)
+    youtube = build("youtube", "v3", credentials=creds)
+    failures = []
+    added = 0
+    for video_id in video_ids:
+        if not video_id or not isinstance(video_id, str):
+            continue
+        try:
+            youtube.playlistItems().insert(
+                part="snippet",
+                body={
+                    "snippet": {
+                        "playlistId": playlist_id,
+                        "resourceId": {
+                            "kind": "youtube#video",
+                            "videoId": video_id,
+                        },
+                    }
+                },
+            ).execute()
+            record_api_call(endpoint="playlistItems.insert", call_type="insert")
+            added += 1
+        except Exception as exc:
+            failures.append({"videoId": video_id, "error": str(exc)})
+    return {"success": len(failures) == 0, "added": added, "failures": failures}
+
+
 @app.route("/login")
 def login():
     error_message = get_client_secrets_error()

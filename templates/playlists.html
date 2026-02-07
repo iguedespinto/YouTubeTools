@@ -102,10 +102,41 @@
             <button class="btn secondary" type="button" id="copy-selected-videos" disabled>Copy selected</button>
             <button class="btn secondary" type="button" id="move-selected-videos" disabled>Move selected</button>
             <button class="btn danger" type="button" id="delete-selected-videos" disabled>Delete selected videos</button>
+            <button class="btn secondary" type="button" id="import-videos-button">Import videos</button>
           </div>
         </div>
         <div id="playlist-viewer" class="viewer-list">
           <div class="viewer-hint">Select a playlist to load its videos.</div>
+        </div>
+      </div>
+    </div>
+    <div id="import-modal-overlay" class="import-modal-overlay">
+      <div class="import-modal">
+        <h3>Import videos</h3>
+        <label>
+          Destination playlist
+          <select id="import-destination">
+            {% for playlist in playlists %}
+              <option value="{{ playlist.id }}">{{ playlist.snippet.title }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <div style="margin-top: 12px;">
+          <label>
+            Paste YouTube URLs, video IDs, or CSV content:
+          </label>
+          <textarea id="import-textarea" placeholder="https://www.youtube.com/watch?v=dQw4w9WgXcQ&#10;https://youtu.be/abc123&#10;or paste Google Takeout CSV..."></textarea>
+        </div>
+        <div style="margin-top: 8px;">
+          <label>
+            Or upload a file (.csv, .txt):
+            <input type="file" id="import-file" accept=".csv,.txt">
+          </label>
+        </div>
+        <div id="import-status" class="import-status"></div>
+        <div class="actions">
+          <button class="btn" type="button" id="import-submit">Import</button>
+          <button class="btn secondary" type="button" id="import-cancel">Cancel</button>
         </div>
       </div>
     </div>
@@ -884,5 +915,189 @@
       mergeSelectedButton.addEventListener('click', startMerge);
     }
     window.startMerge = startMerge;
+
+    /* ── Import videos logic ── */
+    const importModalOverlay = document.getElementById('import-modal-overlay');
+    const importTextarea = document.getElementById('import-textarea');
+    const importFile = document.getElementById('import-file');
+    const importDestination = document.getElementById('import-destination');
+    const importStatus = document.getElementById('import-status');
+    const importSubmitButton = document.getElementById('import-submit');
+    const importCancelButton = document.getElementById('import-cancel');
+    const importVideosButton = document.getElementById('import-videos-button');
+
+    function parseVideoInput(text) {
+      if (!text || !text.trim()) return [];
+      const lines = text.split(/\r?\n/);
+      const ids = new Set();
+
+      /* Detect Google Takeout CSV: look for a header row containing "Video Id" or "Video ID" */
+      let csvVideoIdCol = -1;
+      const firstLine = lines[0].trim();
+      if (firstLine.includes(',')) {
+        const headers = firstLine.split(',').map((h) => h.trim().toLowerCase());
+        csvVideoIdCol = headers.findIndex((h) => h === 'video id' || h === 'video id ');
+        if (csvVideoIdCol === -1) {
+          /* Try "Video Id" with any casing */
+          csvVideoIdCol = headers.findIndex((h) => h.replace(/\s+/g, '').toLowerCase() === 'videoid');
+        }
+      }
+
+      const startIdx = csvVideoIdCol >= 0 ? 1 : 0;
+
+      for (let i = startIdx; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line) continue;
+
+        if (csvVideoIdCol >= 0) {
+          /* CSV mode: extract the video ID column */
+          const cols = line.split(',');
+          const val = (cols[csvVideoIdCol] || '').trim();
+          if (val && /^[A-Za-z0-9_-]{11}$/.test(val)) {
+            ids.add(val);
+          }
+          continue;
+        }
+
+        /* Try to extract video ID from various YouTube URL formats */
+        let match;
+        /* youtube.com/watch?v=VIDEO_ID */
+        match = line.match(/[?&]v=([A-Za-z0-9_-]{11})/);
+        if (match) { ids.add(match[1]); continue; }
+        /* youtu.be/VIDEO_ID */
+        match = line.match(/youtu\.be\/([A-Za-z0-9_-]{11})/);
+        if (match) { ids.add(match[1]); continue; }
+        /* youtube.com/embed/VIDEO_ID */
+        match = line.match(/youtube\.com\/embed\/([A-Za-z0-9_-]{11})/);
+        if (match) { ids.add(match[1]); continue; }
+        /* youtube.com/shorts/VIDEO_ID */
+        match = line.match(/youtube\.com\/shorts\/([A-Za-z0-9_-]{11})/);
+        if (match) { ids.add(match[1]); continue; }
+        /* youtube.com/v/VIDEO_ID */
+        match = line.match(/youtube\.com\/v\/([A-Za-z0-9_-]{11})/);
+        if (match) { ids.add(match[1]); continue; }
+        /* Plain 11-char video ID */
+        const trimmed = line.split(/[\s,;]+/)[0].trim();
+        if (/^[A-Za-z0-9_-]{11}$/.test(trimmed)) {
+          ids.add(trimmed);
+        }
+      }
+      return Array.from(ids);
+    }
+
+    function openImportModal() {
+      if (!importModalOverlay) return;
+      /* Pre-select current playlist if one is active */
+      if (importDestination && currentPlaylistId) {
+        importDestination.value = currentPlaylistId;
+      }
+      if (importTextarea) importTextarea.value = '';
+      if (importFile) importFile.value = '';
+      if (importStatus) importStatus.textContent = '';
+      importModalOverlay.classList.add('visible');
+    }
+
+    function closeImportModal() {
+      if (!importModalOverlay) return;
+      importModalOverlay.classList.remove('visible');
+    }
+
+    if (importVideosButton) {
+      importVideosButton.addEventListener('click', openImportModal);
+    }
+    if (importCancelButton) {
+      importCancelButton.addEventListener('click', closeImportModal);
+    }
+    if (importModalOverlay) {
+      importModalOverlay.addEventListener('click', (e) => {
+        if (e.target === importModalOverlay) closeImportModal();
+      });
+    }
+
+    /* File upload: read file and populate textarea */
+    if (importFile) {
+      importFile.addEventListener('change', () => {
+        const file = importFile.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          if (importTextarea) {
+            importTextarea.value = e.target.result;
+          }
+        };
+        reader.onerror = () => {
+          if (importStatus) importStatus.textContent = 'Failed to read file.';
+        };
+        reader.readAsText(file);
+      });
+    }
+
+    /* Import submit */
+    if (importSubmitButton) {
+      importSubmitButton.addEventListener('click', async () => {
+        const text = importTextarea ? importTextarea.value : '';
+        const videoIds = parseVideoInput(text);
+        if (!videoIds.length) {
+          if (importStatus) importStatus.textContent = 'No valid video IDs found.';
+          return;
+        }
+        const destId = importDestination ? importDestination.value : '';
+        if (!destId) {
+          if (importStatus) importStatus.textContent = 'Please select a destination playlist.';
+          return;
+        }
+
+        importSubmitButton.disabled = true;
+        const originalLabel = importSubmitButton.textContent;
+        importSubmitButton.textContent = 'Importing...';
+        if (importStatus) importStatus.textContent = `Importing ${videoIds.length} video(s)...`;
+
+        try {
+          const response = await fetch(`/playlist/${destId}/import`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Requested-With': 'XMLHttpRequest',
+            },
+            body: JSON.stringify({ video_ids: videoIds }),
+          });
+          const data = await response.json();
+          if (data.success) {
+            const added = data.added || 0;
+            const failures = data.failures || [];
+            let msg = `Successfully added ${added} video(s).`;
+            if (failures.length) {
+              msg += ` ${failures.length} failed.`;
+            }
+            if (importStatus) importStatus.textContent = msg;
+
+            /* Invalidate cache for destination playlist */
+            delete videoCache[destId];
+
+            /* Update sidebar count and total */
+            updatePlaylistCount(destId, added);
+            updateTotalVideos(added);
+
+            /* If currently viewing this playlist, reload it */
+            if (currentPlaylistId === destId) {
+              const row = document.querySelector(`.playlist-list li[data-playlist-id="${destId}"]`);
+              const title = row ? row.querySelector('.playlist-link')?.textContent?.trim() : '';
+              loadPlaylistVideos(destId, title, row);
+            }
+
+            /* Clear the textarea after success */
+            if (importTextarea) importTextarea.value = '';
+            if (importFile) importFile.value = '';
+          } else {
+            if (importStatus) importStatus.textContent = data.error || 'Import failed.';
+          }
+        } catch {
+          if (importStatus) importStatus.textContent = 'Import request failed.';
+        } finally {
+          importSubmitButton.textContent = originalLabel;
+          importSubmitButton.disabled = false;
+        }
+      });
+    }
   </script>
 {% endblock %}
