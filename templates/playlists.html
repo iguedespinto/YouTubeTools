@@ -62,6 +62,9 @@
               <button class="btn secondary view-button" type="button" data-playlist-id="{{ playlist.id }}">
                 View
               </button>
+              <button class="btn secondary rename-button" type="button" data-playlist-id="{{ playlist.id }}">
+                Rename
+              </button>
               <button class="btn secondary dedupe-button" type="button" data-playlist-id="{{ playlist.id }}">
                 Dedupe
               </button>
@@ -86,6 +89,7 @@
         <div class="viewer-header">
           <div>
             <div id="playlist-viewer-title">Playlist videos</div>
+            <div id="playlist-viewer-info" class="viewer-status"></div>
             <div id="playlist-viewer-status" class="viewer-status"></div>
           </div>
           <div class="viewer-actions">
@@ -121,17 +125,149 @@
     const countInput = document.getElementById('count-threshold');
 
     const viewerTitle = document.getElementById('playlist-viewer-title');
+    const viewerInfo = document.getElementById('playlist-viewer-info');
     const viewerStatus = document.getElementById('playlist-viewer-status');
     const deleteSelectedVideosButton = document.getElementById('delete-selected-videos');
     const copySelectedVideosButton = document.getElementById('copy-selected-videos');
     const moveSelectedVideosButton = document.getElementById('move-selected-videos');
     const transferDestinationSelect = document.getElementById('transfer-destination');
     let currentPlaylistId = null;
+    const videoCache = {};
+    let isLoadingMore = false;
+    let scrollCleanup = null;
+
+    function createVideoListItem(item) {
+      const title = item?.title || 'Untitled video';
+      const thumbUrl = item?.thumbnail || '';
+      const videoId = item?.videoId;
+      const playlistItemId = item?.playlistItemId;
+      const listItem = document.createElement('li');
+      listItem.dataset.playlistItemId = playlistItemId || '';
+      listItem.dataset.videoId = videoId || '';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.className = 'video-select';
+      const thumb = document.createElement('img');
+      thumb.className = 'video-thumb';
+      thumb.alt = '';
+      if (thumbUrl) {
+        thumb.src = thumbUrl;
+      }
+      const link = document.createElement('a');
+      link.textContent = title;
+      if (videoId) {
+        link.href = `https://www.youtube.com/watch?v=${videoId}`;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+      }
+      checkbox.addEventListener('change', () => {
+        updateVideoDeleteState();
+        updateTransferState();
+      });
+      listItem.appendChild(checkbox);
+      listItem.appendChild(thumb);
+      listItem.appendChild(link);
+      return listItem;
+    }
+
+    function renderCachedItems(playlistId) {
+      const cached = videoCache[playlistId];
+      if (!cached || !cached.items.length) {
+        viewer.innerHTML = '<div class="viewer-hint">No videos found.</div>';
+        updateViewerInfo();
+        return;
+      }
+      const list = document.createElement('ol');
+      list.className = 'viewer-items';
+      cached.items.forEach((item) => {
+        list.appendChild(createVideoListItem(item));
+      });
+      viewer.innerHTML = '';
+      viewer.appendChild(list);
+      updateVideoDeleteState();
+      updateTransferState();
+      updateViewerInfo();
+    }
+
+    function loadMoreVideos(playlistId) {
+      const cached = videoCache[playlistId];
+      if (!cached || !cached.nextPageToken || isLoadingMore) return;
+      isLoadingMore = true;
+      const list = viewer.querySelector('.viewer-items');
+      const loadingEl = document.createElement('div');
+      loadingEl.className = 'scroll-loading';
+      loadingEl.textContent = 'Loading more...';
+      if (list) list.after(loadingEl);
+      fetch(`/playlist/${playlistId}/items?pageToken=${encodeURIComponent(cached.nextPageToken)}`)
+        .then((response) => response.json())
+        .then((data) => {
+          if (currentPlaylistId !== playlistId) return;
+          const newItems = data.items || [];
+          cached.items.push(...newItems);
+          cached.nextPageToken = data.nextPageToken || null;
+          if (list) {
+            newItems.forEach((item) => {
+              list.appendChild(createVideoListItem(item));
+            });
+          }
+          updateViewerInfo();
+        })
+        .catch(() => {
+          /* silently fail, user can scroll again */
+        })
+        .finally(() => {
+          loadingEl.remove();
+          isLoadingMore = false;
+        });
+    }
+
+    function setupInfiniteScroll(playlistId) {
+      if (scrollCleanup) {
+        scrollCleanup();
+        scrollCleanup = null;
+      }
+      const cached = videoCache[playlistId];
+      if (!cached?.nextPageToken) return;
+      function onScroll() {
+        if (isLoadingMore) return;
+        if (currentPlaylistId !== playlistId) {
+          viewer.removeEventListener('scroll', onScroll);
+          scrollCleanup = null;
+          return;
+        }
+        const c = videoCache[playlistId];
+        if (!c?.nextPageToken) {
+          viewer.removeEventListener('scroll', onScroll);
+          scrollCleanup = null;
+          return;
+        }
+        if (viewer.scrollTop + viewer.clientHeight >= viewer.scrollHeight - 200) {
+          loadMoreVideos(playlistId);
+        }
+      }
+      viewer.addEventListener('scroll', onScroll);
+      scrollCleanup = () => viewer.removeEventListener('scroll', onScroll);
+    }
+
+    function updateViewerInfo() {
+      if (!viewerInfo || !currentPlaylistId) return;
+      const row = document.querySelector(`.playlist-list li[data-playlist-id="${currentPlaylistId}"]`);
+      const totalCount = row ? parseInt(row.dataset.count || '0', 10) : 0;
+      const cached = videoCache[currentPlaylistId];
+      const loadedCount = cached ? cached.items.length : 0;
+      const selectedCount = viewer.querySelectorAll('.video-select:checked').length;
+      let text = `${loadedCount} of ${totalCount} videos`;
+      if (selectedCount > 0) {
+        text += ` · ${selectedCount} selected`;
+      }
+      viewerInfo.textContent = text;
+    }
 
     function updateVideoDeleteState() {
       if (!deleteSelectedVideosButton) return;
       const anySelected = viewer.querySelectorAll('.video-select:checked').length > 0;
       deleteSelectedVideosButton.disabled = !anySelected;
+      updateViewerInfo();
     }
 
     function updateTransferState() {
@@ -167,6 +303,9 @@
       if (viewerTitle && playlistTitle) {
         viewerTitle.textContent = `Playlist videos: ${playlistTitle}`;
       }
+      if (viewerInfo) {
+        viewerInfo.textContent = '';
+      }
       if (viewerStatus) {
         viewerStatus.textContent = '';
       }
@@ -177,53 +316,25 @@
         rowElement.classList.add('active');
       }
       updateDestinationOptions();
+
+      if (videoCache[playlistId]) {
+        renderCachedItems(playlistId);
+        setupInfiniteScroll(playlistId);
+        return;
+      }
+
       viewer.innerHTML = '<div class="viewer-hint">Loading...</div>';
       fetch(`/playlist/${playlistId}/items`)
         .then((response) => response.json())
         .then((data) => {
-          if (!data.items || !data.items.length) {
-            viewer.innerHTML = '<div class="viewer-hint">No videos found.</div>';
-            return;
-          }
-          const list = document.createElement('ol');
-          list.className = 'viewer-items';
-          data.items.forEach((item) => {
-            const title = item?.title || 'Untitled video';
-            const thumbUrl = item?.thumbnail || '';
-            const videoId = item?.videoId;
-            const playlistItemId = item?.playlistItemId;
-            const listItem = document.createElement('li');
-            listItem.dataset.playlistItemId = playlistItemId || '';
-            listItem.dataset.videoId = videoId || '';
-            const link = document.createElement('a');
-            const thumb = document.createElement('img');
-            const checkbox = document.createElement('input');
-            checkbox.type = 'checkbox';
-            checkbox.className = 'video-select';
-            thumb.className = 'video-thumb';
-            thumb.alt = '';
-            if (thumbUrl) {
-              thumb.src = thumbUrl;
-            }
-            link.textContent = title;
-            if (videoId) {
-              link.href = `https://www.youtube.com/watch?v=${videoId}`;
-              link.target = '_blank';
-              link.rel = 'noopener noreferrer';
-            }
-            checkbox.addEventListener('change', () => {
-              updateVideoDeleteState();
-              updateTransferState();
-            });
-            listItem.appendChild(checkbox);
-            listItem.appendChild(thumb);
-            listItem.appendChild(link);
-            list.appendChild(listItem);
-          });
-          viewer.innerHTML = '';
-          viewer.appendChild(list);
-          updateVideoDeleteState();
-          updateTransferState();
+          if (currentPlaylistId !== playlistId) return;
+          const items = data.items || [];
+          videoCache[playlistId] = {
+            items: items,
+            nextPageToken: data.nextPageToken || null,
+          };
+          renderCachedItems(playlistId);
+          setupInfiniteScroll(playlistId);
         })
         .catch(() => {
           viewer.innerHTML = '<div class="viewer-hint">Failed to load videos.</div>';
@@ -235,6 +346,53 @@
         const li = button.closest('li');
         const title = li ? li.querySelector('.playlist-link')?.textContent?.trim() : '';
         loadPlaylistVideos(button.dataset.playlistId, title, li);
+      });
+    });
+
+    document.querySelectorAll('.rename-button').forEach((button) => {
+      button.addEventListener('click', () => {
+        const li = button.closest('li');
+        const playlistId = li?.dataset.playlistId || button.dataset.playlistId;
+        if (!playlistId) return;
+        const currentTitle = li?.querySelector('.playlist-link')?.textContent?.trim() || '';
+        const newName = prompt('New playlist name', currentTitle);
+        if (!newName) return;
+        const trimmed = newName.trim();
+        if (!trimmed) return;
+        button.disabled = true;
+        const originalLabel = button.textContent;
+        button.textContent = 'Renaming...';
+        fetch(`/playlist/${playlistId}/rename`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest',
+          },
+          body: JSON.stringify({ name: trimmed }),
+        })
+          .then((response) => response.json())
+          .then((data) => {
+            if (!data.success) {
+              alert(data.error || 'Failed to rename playlist.');
+              return;
+            }
+            const link = li?.querySelector('.playlist-link');
+            if (link) {
+              link.textContent = data.name || trimmed;
+              link.dataset.title = data.name || trimmed;
+            }
+            if (viewerTitle && currentPlaylistId === playlistId) {
+              viewerTitle.textContent = `Playlist videos: ${data.name || trimmed}`;
+            }
+            updateDestinationOptions();
+          })
+          .catch(() => {
+            alert('Failed to rename playlist.');
+          })
+          .finally(() => {
+            button.textContent = originalLabel;
+            button.disabled = false;
+          });
       });
     });
 
@@ -280,6 +438,7 @@
                 totalVideosEl.textContent = `${Math.max(currentTotal - removedCount, 0)}`;
               }
             }
+            delete videoCache[playlistId];
             if (currentPlaylistId === playlistId) {
               const title = li ? li.querySelector('.playlist-link')?.textContent?.trim() : '';
               loadPlaylistVideos(playlistId, title, li);
@@ -412,6 +571,14 @@
             const removedCount = data.failures && data.failures.length
               ? selectedItems.length - data.failures.length
               : selectedItems.length;
+            if (videoCache[currentPlaylistId]) {
+              const failedIds = data.failures ? new Set(data.failures.map((f) => f.id)) : new Set();
+              const removedIds = new Set(
+                selectedItems.map((item) => item.playlistItemId).filter((id) => id && !failedIds.has(id))
+              );
+              videoCache[currentPlaylistId].items = videoCache[currentPlaylistId].items
+                .filter((item) => !removedIds.has(item.playlistItemId));
+            }
             updatePlaylistCount(currentPlaylistId, -removedCount);
             updateTotalVideos(-removedCount);
             updateVideoDeleteState();
@@ -475,12 +642,18 @@
           }
           const added = data.added || 0;
           const removed = data.removed || 0;
+          delete videoCache[destinationId];
           if (mode === 'move' && removed) {
             selectedItems.forEach((item) => {
               if (item.playlistItemId) {
                 item.li.remove();
               }
             });
+            if (videoCache[currentPlaylistId]) {
+              const movedIds = new Set(selectedItems.map((item) => item.playlistItemId).filter(Boolean));
+              videoCache[currentPlaylistId].items = videoCache[currentPlaylistId].items
+                .filter((item) => !movedIds.has(item.playlistItemId));
+            }
             updatePlaylistCount(currentPlaylistId, -removed);
             updateTotalVideos(-removed);
           }
@@ -532,6 +705,8 @@
               return;
             }
             const li = form.closest('li');
+            const deletedPlaylistId = li?.dataset?.playlistId;
+            if (deletedPlaylistId) delete videoCache[deletedPlaylistId];
             if (li) li.remove();
             updateBulkState();
           })
@@ -604,6 +779,7 @@
             });
             const data = await response.json();
             if (data.success) {
+              delete videoCache[playlistId];
               li.remove();
             } else {
               failures.push(playlistId);
@@ -674,6 +850,7 @@
           if (!data.success && data.failures && data.failures.length) {
             hasFailures = true;
           }
+          delete videoCache[source.id];
           source.li.remove();
         } catch {
           hasFailures = true;
@@ -683,6 +860,7 @@
           mergeStatus.textContent = `Transferring: ${transferred} of ${totalToTransfer}`;
         }
       }
+      delete videoCache[target.id];
       if (hasFailures) {
         alert('Some playlists could not be merged.');
       }

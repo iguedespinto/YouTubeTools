@@ -1,12 +1,13 @@
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from flask import Flask, redirect, render_template, request, session, url_for
 from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from pymongo import MongoClient
 
 SCOPES = ["https://www.googleapis.com/auth/youtube"]
 try:
@@ -33,6 +34,17 @@ TOKEN_FILE = (
 API_CALL_QUOTA = os.getenv("YT_API_CALLS_QUOTA")
 API_CALL_COUNT = 0
 
+MONGODB_CONNECTION_STRING = os.getenv("MONGODB_CONNECTION_STRING")
+mongo_client = MongoClient(MONGODB_CONNECTION_STRING)
+mongo_db = mongo_client.get_default_database()
+api_logs_collection = mongo_db["api_logs"]
+
+# On startup, delete logged records from previous days
+today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+deleted = api_logs_collection.delete_many({"timestamp": {"$lt": today_start}})
+if deleted.deleted_count > 0:
+    print(f"[Startup] Deleted {deleted.deleted_count} API log record(s) from previous days.")
+
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_secret_key_change_me")
 
@@ -51,9 +63,14 @@ def credentials_to_dict(credentials):
     return data
 
 
-def record_api_call(count=1):
+def record_api_call(endpoint="unknown", call_type="unknown", count=1):
     global API_CALL_COUNT
     API_CALL_COUNT += count
+    api_logs_collection.insert_one({
+        "timestamp": datetime.now(timezone.utc),
+        "endpoint": endpoint,
+        "type": call_type,
+    })
 
 
 def get_flow(state=None):
@@ -174,7 +191,7 @@ def get_playlists(credentials_dict):
     )
     while request_page is not None:
         response = request_page.execute()
-        record_api_call()
+        record_api_call(endpoint="playlists.list", call_type="list")
         playlists.extend(response.get("items", []))
         request_page = youtube.playlists().list_next(request_page, response)
     return playlists
@@ -247,7 +264,7 @@ def delete_playlist(playlist_id):
     youtube = build("youtube", "v3", credentials=creds)
     try:
         youtube.playlists().delete(id=playlist_id).execute()
-        record_api_call()
+        record_api_call(endpoint="playlists.delete", call_type="delete")
     except Exception as exc:
         if request.headers.get("X-Requested-With") == "XMLHttpRequest":
             return {"error": str(exc)}, 400
@@ -278,7 +295,7 @@ def delete_bulk():
     for playlist_id in playlist_ids:
         try:
             youtube.playlists().delete(id=playlist_id).execute()
-            record_api_call()
+            record_api_call(endpoint="playlists.delete", call_type="delete")
         except Exception as exc:
             failures.append({"id": playlist_id, "error": str(exc)})
     return {"success": len(failures) == 0, "failures": failures}
@@ -295,19 +312,17 @@ def playlist_items(playlist_id):
         creds.refresh(Request())
         save_credentials(creds)
     youtube = build("youtube", "v3", credentials=creds)
-    items = []
-    request_page = youtube.playlistItems().list(
+    page_token = request.args.get("pageToken") or None
+    api_request = youtube.playlistItems().list(
         part="snippet,contentDetails",
         playlistId=playlist_id,
         maxResults=50,
+        pageToken=page_token,
     )
-    while request_page is not None:
-        response = request_page.execute()
-        record_api_call()
-        items.extend(response.get("items", []))
-        request_page = youtube.playlistItems().list_next(request_page, response)
+    response = api_request.execute()
+    record_api_call(endpoint="playlistItems.list", call_type="list")
     simplified = []
-    for item in items:
+    for item in response.get("items", []):
         snippet = item.get("snippet") or {}
         details = item.get("contentDetails") or {}
         simplified.append(
@@ -318,7 +333,10 @@ def playlist_items(playlist_id):
                 "thumbnail": ((snippet.get("thumbnails") or {}).get("default") or {}).get("url"),
             }
         )
-    return {"items": simplified}
+    return {
+        "items": simplified,
+        "nextPageToken": response.get("nextPageToken"),
+    }
 
 
 @app.route("/playlist/<playlist_id>/dedupe", methods=["POST"])
@@ -340,7 +358,7 @@ def dedupe_playlist(playlist_id):
     )
     while request_page is not None:
         response = request_page.execute()
-        record_api_call()
+        record_api_call(endpoint="playlistItems.list", call_type="list")
         items.extend(response.get("items", []))
         request_page = youtube.playlistItems().list_next(request_page, response)
     seen_video_ids = set()
@@ -359,7 +377,7 @@ def dedupe_playlist(playlist_id):
     for item_id in duplicate_item_ids:
         try:
             youtube.playlistItems().delete(id=item_id).execute()
-            record_api_call()
+            record_api_call(endpoint="playlistItems.delete", call_type="delete")
         except Exception as exc:
             failures.append({"id": item_id, "error": str(exc)})
     removed_count = len(duplicate_item_ids) - len(failures)
@@ -392,7 +410,7 @@ def delete_playlist_items_bulk(playlist_id):
     for item_id in item_ids:
         try:
             youtube.playlistItems().delete(id=item_id).execute()
-            record_api_call()
+            record_api_call(endpoint="playlistItems.delete", call_type="delete")
         except Exception as exc:
             failures.append({"id": item_id, "error": str(exc)})
     return {"success": len(failures) == 0, "failures": failures}
@@ -443,7 +461,7 @@ def transfer_playlist_items(playlist_id):
                     }
                 },
             ).execute()
-            record_api_call()
+            record_api_call(endpoint="playlistItems.insert", call_type="insert")
             added += 1
             if mode == "move" and playlist_item_id:
                 delete_after.append(playlist_item_id)
@@ -454,7 +472,7 @@ def transfer_playlist_items(playlist_id):
         for item_id in delete_after:
             try:
                 youtube.playlistItems().delete(id=item_id).execute()
-                record_api_call()
+                record_api_call(endpoint="playlistItems.delete", call_type="delete")
                 removed += 1
             except Exception as exc:
                 failures.append({"id": item_id, "error": str(exc)})
@@ -498,7 +516,7 @@ def merge_playlists():
         )
         while request_page is not None:
             response = request_page.execute()
-            record_api_call()
+            record_api_call(endpoint="playlistItems.list", call_type="list")
             for item in response.get("items", []):
                 video_id = (item.get("contentDetails") or {}).get("videoId")
                 if not video_id:
@@ -516,7 +534,7 @@ def merge_playlists():
                             }
                         },
                     ).execute()
-                    record_api_call()
+                    record_api_call(endpoint="playlistItems.insert", call_type="insert")
                     added += 1
                 except Exception as exc:
                     failures.append({"playlist_id": playlist_id, "video_id": video_id, "error": str(exc)})
@@ -525,7 +543,7 @@ def merge_playlists():
     for playlist_id in source_ids:
         try:
             youtube.playlists().delete(id=playlist_id).execute()
-            record_api_call()
+            record_api_call(endpoint="playlists.delete", call_type="delete")
         except Exception as exc:
             failures.append({"playlist_id": playlist_id, "error": str(exc)})
 
@@ -535,11 +553,39 @@ def merge_playlists():
                 part="snippet",
                 body={"id": target_id, "snippet": {"title": new_name}},
             ).execute()
-            record_api_call()
+            record_api_call(endpoint="playlists.update", call_type="update")
         except Exception as exc:
             failures.append({"playlist_id": target_id, "error": str(exc)})
 
     return {"success": len(failures) == 0, "failures": failures, "added": added}
+
+
+@app.route("/playlist/<playlist_id>/rename", methods=["POST"])
+def rename_playlist(playlist_id):
+    credentials = session.get("credentials") or load_saved_credentials()
+    if not credentials:
+        return {"error": "Not authenticated"}, 401
+    payload = request.get_json(silent=True) or {}
+    new_name = payload.get("name")
+    if new_name is not None:
+        new_name = str(new_name).strip()
+    if not new_name:
+        return {"error": "New name is required"}, 400
+    normalized = normalize_saved_credentials(credentials) or credentials
+    creds = Credentials(**normalized)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        save_credentials(creds)
+    youtube = build("youtube", "v3", credentials=creds)
+    try:
+        youtube.playlists().update(
+            part="snippet",
+            body={"id": playlist_id, "snippet": {"title": new_name}},
+        ).execute()
+        record_api_call(endpoint="playlists.update", call_type="update")
+    except Exception as exc:
+        return {"error": str(exc)}, 400
+    return {"success": True, "name": new_name}
 
 
 @app.route("/login")
