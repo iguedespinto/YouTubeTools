@@ -28,6 +28,7 @@ if not os.getenv("OAUTHLIB_RELAX_TOKEN_SCOPE"):
 CLIENT_SECRETS_FILE = os.getenv("YT_CLIENT_SECRETS", "client_secret.json")
 CLIENT_ID = os.getenv("YT_CLIENT_ID") or os.getenv("CLIENT_ID")
 CLIENT_SECRET = os.getenv("YT_CLIENT_SECRET") or os.getenv("CLIENT_SECRET")
+REDIRECT_URI_OVERRIDE = os.getenv("REDIRECT_URI")  # explicit override if auto-detection fails
 TOKEN_FILE = (
     os.getenv("YT_TOKEN_FILE")
     or os.getenv("TOKEN_FILE")
@@ -115,9 +116,12 @@ def get_youtube_client(credentials_dict):
 
 
 def get_flow(state=None):
-    redirect_uri = url_for("oauth2callback", _external=True)
-    if IS_PRODUCTION and redirect_uri.startswith("http://"):
-        redirect_uri = redirect_uri.replace("http://", "https://", 1)
+    if REDIRECT_URI_OVERRIDE:
+        redirect_uri = REDIRECT_URI_OVERRIDE
+    else:
+        redirect_uri = url_for("oauth2callback", _external=True)
+        if IS_PRODUCTION and redirect_uri.startswith("http://"):
+            redirect_uri = redirect_uri.replace("http://", "https://", 1)
     print(f"[OAuth] redirect_uri = {redirect_uri}", flush=True)
     if CLIENT_ID and CLIENT_SECRET:
         client_config = {
@@ -693,6 +697,23 @@ def logout():
         except OSError:
             pass
     return redirect(url_for("index"))
+
+
+@app.route("/debug-oauth")
+def debug_oauth():
+    redirect_uri = url_for("oauth2callback", _external=True)
+    if IS_PRODUCTION and redirect_uri.startswith("http://"):
+        redirect_uri = redirect_uri.replace("http://", "https://", 1)
+    return {
+        "client_id": CLIENT_ID[:20] + "..." if CLIENT_ID else None,
+        "redirect_uri_auto": redirect_uri,
+        "redirect_uri_override": REDIRECT_URI_OVERRIDE,
+        "redirect_uri_used": REDIRECT_URI_OVERRIDE or redirect_uri,
+        "is_production": IS_PRODUCTION,
+        "request_scheme": request.scheme,
+        "request_host": request.host,
+        "hint": "Copy 'redirect_uri_used' and paste it EXACTLY into Google Cloud Console > Credentials > OAuth 2.0 Client ID > Authorized redirect URIs",
+    }
 
 
 if __name__ == "__main__":
