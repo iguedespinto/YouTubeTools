@@ -705,7 +705,7 @@ def debug_oauth():
     if IS_PRODUCTION and redirect_uri.startswith("http://"):
         redirect_uri = redirect_uri.replace("http://", "https://", 1)
     return {
-        "client_id": CLIENT_ID[:20] + "..." if CLIENT_ID else None,
+        "client_id": CLIENT_ID,
         "redirect_uri_auto": redirect_uri,
         "redirect_uri_override": REDIRECT_URI_OVERRIDE,
         "redirect_uri_used": REDIRECT_URI_OVERRIDE or redirect_uri,
