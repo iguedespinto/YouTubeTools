@@ -51,6 +51,7 @@ app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_secret_key_change_me")
 if IS_PRODUCTION:
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+    app.config["PREFERRED_URL_SCHEME"] = "https"
 
 
 @app.after_request
@@ -114,7 +115,7 @@ def get_youtube_client(credentials_dict):
 
 
 def get_flow(state=None):
-    redirect_uri = url_for("oauth2callback", _external=True)
+    redirect_uri = url_for("oauth2callback", _external=True, _scheme="https") if IS_PRODUCTION else url_for("oauth2callback", _external=True)
     if CLIENT_ID and CLIENT_SECRET:
         client_config = {
             "web": {
@@ -669,7 +670,10 @@ def oauth2callback():
     if error_message:
         return render_template("error.html", error_message=error_message)
     flow = get_flow(state=session.get("state"))
-    flow.fetch_token(authorization_response=request.url)
+    authorization_response = request.url
+    if IS_PRODUCTION:
+        authorization_response = authorization_response.replace("http://", "https://", 1)
+    flow.fetch_token(authorization_response=authorization_response)
     credentials = flow.credentials
     session["credentials"] = credentials_to_dict(credentials)
     save_credentials(credentials)
