@@ -5,3 +5,4 @@ google-auth-oauthlib==1.2.1
 pymongo==4.16.0
 dnspython==2.8.0
 python-dotenv==1.2.1
+gunicorn==23.0.0

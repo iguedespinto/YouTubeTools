@@ -3,6 +3,7 @@ import os
 from datetime import datetime, timezone, timedelta
 
 from flask import Flask, redirect, render_template, request, session, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
 from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -18,7 +19,8 @@ except ImportError:  # optional
 if load_dotenv:
     load_dotenv()
 
-if not os.getenv("OAUTHLIB_INSECURE_TRANSPORT"):
+IS_PRODUCTION = os.getenv("DYNO") is not None  # Heroku sets DYNO automatically
+if not IS_PRODUCTION and not os.getenv("OAUTHLIB_INSECURE_TRANSPORT"):
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 if not os.getenv("OAUTHLIB_RELAX_TOKEN_SCOPE"):
     os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
@@ -47,6 +49,8 @@ if deleted.deleted_count > 0:
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_secret_key_change_me")
+if IS_PRODUCTION:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 
 @app.after_request
@@ -196,6 +200,9 @@ def load_saved_credentials():
 
 def save_credentials(credentials):
     try:
+        token_dir = os.path.dirname(TOKEN_FILE)
+        if token_dir:
+            os.makedirs(token_dir, exist_ok=True)
         existing = load_saved_credentials() or {}
         data = credentials_to_dict(credentials)
         if not data.get("refresh_token") and existing.get("refresh_token"):
