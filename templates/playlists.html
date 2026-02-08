@@ -6,10 +6,11 @@
     <a class="btn secondary" href="{{ url_for('logout') }}">Disconnect</a>
   </div>
   <div class="meta">
-    Total playlists: {{ total_playlists }} · Total videos: <span id="total-videos">{{ total_videos }}</span>
-    · API calls used (today): {{ api_calls_used }}
+    Total playlists: <span id="total-playlists">{{ total_playlists }}</span>
+    · Total videos: <span id="total-videos">{{ total_videos }}</span>
+    · API calls used (today): <span id="api-calls-today">{{ api_calls_used }}</span>
     {% if api_calls_remaining is not none %}
-      · Estimated remaining: {{ api_calls_remaining }}
+      · Estimated remaining: <span id="api-calls-remaining">{{ api_calls_remaining }}</span>
     {% endif %}
   </div>
   <form method="get">
@@ -162,8 +163,34 @@
     const playlistSearch = document.getElementById('playlist-search');
     const playlistList = document.getElementById('playlist-list');
     const totalVideosEl = document.getElementById('total-videos');
+    const totalPlaylistsEl = document.getElementById('total-playlists');
+    const apiCallsTodayEl = document.getElementById('api-calls-today');
+    const apiCallsRemainingEl = document.getElementById('api-calls-remaining');
+    const initialApiQuota = (() => {
+      const used = parseInt(apiCallsTodayEl?.textContent || '0', 10);
+      const remaining = parseInt(apiCallsRemainingEl?.textContent || '0', 10);
+      if (apiCallsRemainingEl && !Number.isNaN(used) && !Number.isNaN(remaining)) {
+        return used + remaining;
+      }
+      return null;
+    })();
     let searchTimer = null;
     const countInput = document.getElementById('count-threshold');
+
+    /* Wrap fetch to auto-update API stats from every JSON response */
+    const _originalFetch = window.fetch;
+    window.fetch = function(...args) {
+      return _originalFetch.apply(this, args).then((response) => {
+        const origJson = response.json.bind(response);
+        response.json = () => origJson().then((data) => {
+          if (data && typeof data === 'object' && typeof data.apiCallsToday !== 'undefined') {
+            updateApiStats(data);
+          }
+          return data;
+        });
+        return response;
+      });
+    };
 
     const viewerTitle = document.getElementById('playlist-viewer-title');
     const viewerInfo = document.getElementById('playlist-viewer-info');
@@ -696,6 +723,22 @@
       totalVideosEl.textContent = `${Math.max(currentTotal + delta, 0)}`;
     }
 
+    function updateTotalPlaylists(delta) {
+      if (!totalPlaylistsEl || !Number.isFinite(delta)) return;
+      const current = parseInt(totalPlaylistsEl.textContent || '0', 10);
+      if (Number.isNaN(current)) return;
+      totalPlaylistsEl.textContent = `${Math.max(current + delta, 0)}`;
+    }
+
+    function updateApiStats(data) {
+      if (!data || typeof data.apiCallsToday === 'undefined') return;
+      const count = data.apiCallsToday;
+      if (apiCallsTodayEl) apiCallsTodayEl.textContent = `${count}`;
+      if (apiCallsRemainingEl && initialApiQuota !== null) {
+        apiCallsRemainingEl.textContent = `${Math.max(initialApiQuota - count, 0)}`;
+      }
+    }
+
     if (deleteSelectedVideosButton) {
       deleteSelectedVideosButton.addEventListener('click', () => {
         const selectedItems = collectSelectedVideoItems();
@@ -870,8 +913,11 @@
             }
             const li = form.closest('li');
             const deletedPlaylistId = li?.dataset?.playlistId;
+            const deletedCount = parseInt(li?.dataset?.count || '0', 10);
             if (deletedPlaylistId) delete videoCache[deletedPlaylistId];
             if (li) li.remove();
+            updateTotalPlaylists(-1);
+            if (!Number.isNaN(deletedCount)) updateTotalVideos(-deletedCount);
             updateBulkState();
           })
           .catch(() => {
@@ -943,8 +989,11 @@
             });
             const data = await response.json();
             if (data.success) {
+              const deletedCount = parseInt(li.dataset.count || '0', 10);
               delete videoCache[playlistId];
               li.remove();
+              updateTotalPlaylists(-1);
+              if (!Number.isNaN(deletedCount)) updateTotalVideos(-deletedCount);
             } else {
               failures.push(playlistId);
             }
@@ -1016,6 +1065,7 @@
           }
           delete videoCache[source.id];
           source.li.remove();
+          updateTotalPlaylists(-1);
         } catch {
           hasFailures = true;
         }

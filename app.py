@@ -49,6 +49,20 @@ app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_secret_key_change_me")
 
 
+@app.after_request
+def inject_api_stats(response):
+    """Inject apiCallsToday into every JSON response so the frontend can update stats."""
+    if response.content_type and "application/json" in response.content_type:
+        try:
+            data = response.get_json()
+            if isinstance(data, dict):
+                data["apiCallsToday"] = get_api_calls_today()
+                response.set_data(json.dumps(data))
+        except Exception:
+            pass
+    return response
+
+
 def credentials_to_dict(credentials):
     data = {
         "token": credentials.token,
@@ -71,6 +85,28 @@ def record_api_call(endpoint="unknown", call_type="unknown", count=1):
         "endpoint": endpoint,
         "type": call_type,
     })
+
+
+def get_api_calls_today():
+    today_start_utc = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return api_logs_collection.count_documents({"timestamp": {"$gte": today_start_utc}})
+
+
+def get_youtube_client(credentials_dict):
+    """Build a YouTube API client from stored credentials, refreshing if needed.
+
+    Uses a static discovery document to avoid making a discovery HTTP request
+    on every call (the googleapiclient makes one network call per build() by
+    default, which inflates the request count seen in the Google Cloud console).
+    """
+    normalized = normalize_saved_credentials(credentials_dict) or credentials_dict
+    creds = Credentials(**normalized)
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        save_credentials(creds)
+    return build("youtube", "v3", credentials=creds, cache_discovery=True), creds
 
 
 def get_flow(state=None):
@@ -177,12 +213,7 @@ def save_credentials(credentials):
 
 
 def get_playlists(credentials_dict):
-    normalized = normalize_saved_credentials(credentials_dict) or credentials_dict
-    credentials = Credentials(**normalized)
-    if credentials.expired and credentials.refresh_token:
-        credentials.refresh(Request())
-        save_credentials(credentials)
-    youtube = build("youtube", "v3", credentials=credentials)
+    youtube, _ = get_youtube_client(credentials_dict)
     playlists = []
     request_page = youtube.playlists().list(
         part="snippet,contentDetails",
@@ -232,8 +263,7 @@ def index():
         (item.get("contentDetails", {}).get("itemCount", 0) or 0)
         for item in playlists
     )
-    today_start_utc = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    api_calls_today = api_logs_collection.count_documents({"timestamp": {"$gte": today_start_utc}})
+    api_calls_today = get_api_calls_today()
     try:
         quota = int(API_CALL_QUOTA) if API_CALL_QUOTA else None
     except ValueError:
@@ -258,12 +288,7 @@ def delete_playlist(playlist_id):
     credentials = session.get("credentials") or load_saved_credentials()
     if not credentials:
         return redirect(url_for("index"))
-    normalized = normalize_saved_credentials(credentials) or credentials
-    creds = Credentials(**normalized)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        save_credentials(creds)
-    youtube = build("youtube", "v3", credentials=creds)
+    youtube, _ = get_youtube_client(credentials)
     try:
         youtube.playlists().delete(id=playlist_id).execute()
         record_api_call(endpoint="playlists.delete", call_type="delete")
@@ -287,12 +312,7 @@ def delete_bulk():
     playlist_ids = payload.get("playlist_ids") or []
     if not isinstance(playlist_ids, list) or not playlist_ids:
         return {"error": "No playlists provided"}, 400
-    normalized = normalize_saved_credentials(credentials) or credentials
-    creds = Credentials(**normalized)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        save_credentials(creds)
-    youtube = build("youtube", "v3", credentials=creds)
+    youtube, _ = get_youtube_client(credentials)
     failures = []
     for playlist_id in playlist_ids:
         try:
@@ -308,12 +328,7 @@ def playlist_items(playlist_id):
     credentials = session.get("credentials") or load_saved_credentials()
     if not credentials:
         return {"error": "Not authenticated"}, 401
-    normalized = normalize_saved_credentials(credentials) or credentials
-    creds = Credentials(**normalized)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        save_credentials(creds)
-    youtube = build("youtube", "v3", credentials=creds)
+    youtube, _ = get_youtube_client(credentials)
     page_token = request.args.get("pageToken") or None
     api_request = youtube.playlistItems().list(
         part="snippet,contentDetails",
@@ -361,12 +376,7 @@ def dedupe_playlist(playlist_id):
     credentials = session.get("credentials") or load_saved_credentials()
     if not credentials:
         return {"error": "Not authenticated"}, 401
-    normalized = normalize_saved_credentials(credentials) or credentials
-    creds = Credentials(**normalized)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        save_credentials(creds)
-    youtube = build("youtube", "v3", credentials=creds)
+    youtube, _ = get_youtube_client(credentials)
     items = []
     request_page = youtube.playlistItems().list(
         part="contentDetails",
@@ -417,12 +427,7 @@ def delete_playlist_items_bulk(playlist_id):
     item_ids = payload.get("playlist_item_ids") or []
     if not isinstance(item_ids, list) or not item_ids:
         return {"error": "No items provided"}, 400
-    normalized = normalize_saved_credentials(credentials) or credentials
-    creds = Credentials(**normalized)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        save_credentials(creds)
-    youtube = build("youtube", "v3", credentials=creds)
+    youtube, _ = get_youtube_client(credentials)
     failures = []
     for item_id in item_ids:
         try:
@@ -448,12 +453,7 @@ def transfer_playlist_items(playlist_id):
         return {"error": "Destination playlist is required"}, 400
     if not isinstance(items, list) or not items:
         return {"error": "No items provided"}, 400
-    normalized = normalize_saved_credentials(credentials) or credentials
-    creds = Credentials(**normalized)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        save_credentials(creds)
-    youtube = build("youtube", "v3", credentials=creds)
+    youtube, _ = get_youtube_client(credentials)
     failures = []
     added = 0
     delete_after = []
@@ -516,12 +516,7 @@ def merge_playlists():
         return {"error": "Invalid playlist selection"}, 400
     if new_name is not None and not new_name:
         return {"error": "New name is required"}, 400
-    normalized = normalize_saved_credentials(credentials) or credentials
-    creds = Credentials(**normalized)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        save_credentials(creds)
-    youtube = build("youtube", "v3", credentials=creds)
+    youtube, _ = get_youtube_client(credentials)
 
     failures = []
     added = 0
@@ -588,12 +583,7 @@ def rename_playlist(playlist_id):
         new_name = str(new_name).strip()
     if not new_name:
         return {"error": "New name is required"}, 400
-    normalized = normalize_saved_credentials(credentials) or credentials
-    creds = Credentials(**normalized)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        save_credentials(creds)
-    youtube = build("youtube", "v3", credentials=creds)
+    youtube, _ = get_youtube_client(credentials)
     try:
         # Fetch existing snippet so we preserve description and other fields
         existing = youtube.playlists().list(
@@ -625,12 +615,7 @@ def import_videos(playlist_id):
     video_ids = payload.get("video_ids") or []
     if not isinstance(video_ids, list) or not video_ids:
         return {"error": "No video IDs provided"}, 400
-    normalized = normalize_saved_credentials(credentials) or credentials
-    creds = Credentials(**normalized)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        save_credentials(creds)
-    youtube = build("youtube", "v3", credentials=creds)
+    youtube, _ = get_youtube_client(credentials)
     failures = []
     added = 0
     for video_id in video_ids:
