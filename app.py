@@ -115,7 +115,10 @@ def get_youtube_client(credentials_dict):
 
 
 def get_flow(state=None):
-    redirect_uri = url_for("oauth2callback", _external=True, _scheme="https") if IS_PRODUCTION else url_for("oauth2callback", _external=True)
+    redirect_uri = url_for("oauth2callback", _external=True)
+    if IS_PRODUCTION and redirect_uri.startswith("http://"):
+        redirect_uri = redirect_uri.replace("http://", "https://", 1)
+    print(f"[OAuth] redirect_uri = {redirect_uri}", flush=True)
     if CLIENT_ID and CLIENT_SECRET:
         client_config = {
             "web": {
@@ -660,6 +663,7 @@ def login():
         include_granted_scopes="true",
         prompt="consent",
     )
+    print(f"[OAuth] authorization_url = {authorization_url}", flush=True)
     session["state"] = state
     return redirect(authorization_url)
 
