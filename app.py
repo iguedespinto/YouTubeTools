@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from datetime import datetime, timezone, timedelta
@@ -35,12 +36,32 @@ TOKEN_FILE = (
     or "token.json"
 )
 API_CALL_QUOTA = os.getenv("YT_API_CALLS_QUOTA")
-API_CALL_COUNT = 0
+# YouTube Data API v3 default daily quota, measured in *units* (not calls).
+# Used as the budget when YT_API_CALLS_QUOTA is not set.
+DEFAULT_QUOTA_LIMIT = 10000
+API_CALL_COUNT = 0  # running total of quota *units* spent this process
+
+# Per-operation quota-unit costs.
+# Reads cost 1 unit; writes (insert/update/delete) cost 50 units each.
+# https://developers.google.com/youtube/v3/determine_quota_cost
+QUOTA_UNIT_COSTS = {"list": 1, "insert": 50, "update": 50, "delete": 50}
+DEFAULT_UNIT_COST = 1
+WRITE_UNIT_COST = 50
+
+# How long to cache the user's playlist list server-side before refetching.
+PLAYLIST_CACHE_TTL_SECONDS = int(os.getenv("YT_PLAYLIST_CACHE_TTL", "300"))
 
 MONGODB_CONNECTION_STRING = os.getenv("MONGODB_CONNECTION_STRING")
 mongo_client = MongoClient(MONGODB_CONNECTION_STRING)
 mongo_db = mongo_client.get_default_database()
 api_logs_collection = mongo_db["api_logs"]
+playlist_cache_collection = mongo_db["playlist_cache"]
+
+# Index the timestamp so the daily quota tally is an index-only scan.
+try:
+    api_logs_collection.create_index("timestamp")
+except Exception:
+    pass
 
 # On startup, delete logged records from previous days
 today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -57,12 +78,12 @@ if IS_PRODUCTION:
 
 @app.after_request
 def inject_api_stats(response):
-    """Inject apiCallsToday into every JSON response so the frontend can update stats."""
+    """Inject quotaUnitsToday into every JSON response so the frontend can update stats."""
     if response.content_type and "application/json" in response.content_type:
         try:
             data = response.get_json()
             if isinstance(data, dict):
-                data["apiCallsToday"] = get_api_calls_today()
+                data["quotaUnitsToday"] = get_api_calls_today()
                 response.set_data(json.dumps(data))
         except Exception:
             pass
@@ -84,35 +105,61 @@ def credentials_to_dict(credentials):
 
 
 def record_api_call(endpoint="unknown", call_type="unknown", count=1):
+    """Log an API call weighted by its true quota-unit cost (read=1, write=50)."""
     global API_CALL_COUNT
-    API_CALL_COUNT += count
+    units = QUOTA_UNIT_COSTS.get(call_type, DEFAULT_UNIT_COST) * count
+    API_CALL_COUNT += units
     api_logs_collection.insert_one({
         "timestamp": datetime.now(timezone.utc),
         "endpoint": endpoint,
         "type": call_type,
+        "units": units,
     })
 
 
 def get_api_calls_today():
+    """Return total quota *units* (not raw call count) spent today."""
     today_start_utc = datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
-    return api_logs_collection.count_documents({"timestamp": {"$gte": today_start_utc}})
+    cursor = api_logs_collection.aggregate([
+        {"$match": {"timestamp": {"$gte": today_start_utc}}},
+        {"$group": {"_id": None, "units": {"$sum": {"$ifNull": ["$units", 1]}}}},
+    ])
+    doc = next(iter(cursor), None)
+    return int(doc["units"]) if doc else 0
+
+
+def get_quota_limit():
+    try:
+        return int(API_CALL_QUOTA) if API_CALL_QUOTA else DEFAULT_QUOTA_LIMIT
+    except (TypeError, ValueError):
+        return DEFAULT_QUOTA_LIMIT
+
+
+def get_quota_remaining():
+    return max(get_quota_limit() - get_api_calls_today(), 0)
+
+
+def remaining_write_budget():
+    """How many 50-unit write operations we can still afford today."""
+    return get_quota_remaining() // WRITE_UNIT_COST
 
 
 def get_youtube_client(credentials_dict):
     """Build a YouTube API client from stored credentials, refreshing if needed.
 
-    Uses a static discovery document to avoid making a discovery HTTP request
-    on every call (the googleapiclient makes one network call per build() by
-    default, which inflates the request count seen in the Google Cloud console).
+    Uses the static discovery document bundled with google-api-python-client
+    (static_discovery=True, the default in v2+), so build() makes no network
+    request. Note: discovery fetches never count against the YouTube Data API
+    quota regardless — only actual youtube/v3 method calls do.
     """
     normalized = normalize_saved_credentials(credentials_dict) or credentials_dict
     creds = Credentials(**normalized)
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
         save_credentials(creds)
-    return build("youtube", "v3", credentials=creds, cache_discovery=True), creds
+    return build("youtube", "v3", credentials=creds, static_discovery=True), creds
 
 
 def get_flow(state=None):
@@ -227,6 +274,72 @@ def save_credentials(credentials):
         return
 
 
+def cache_key_for(credentials_dict):
+    creds = credentials_dict or {}
+    token = creds.get("refresh_token") or creds.get("token") or "default"
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def get_cached_playlists(credentials_dict):
+    """Return the cached playlist list if fresh, else None."""
+    try:
+        doc = playlist_cache_collection.find_one({"_id": cache_key_for(credentials_dict)})
+    except Exception:
+        return None
+    if not doc:
+        return None
+    fetched_at = doc.get("fetched_at")
+    if not isinstance(fetched_at, datetime):
+        return None
+    if fetched_at.tzinfo is None:
+        fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - fetched_at).total_seconds()
+    if age > PLAYLIST_CACHE_TTL_SECONDS:
+        return None
+    return doc.get("items")
+
+
+def set_cached_playlists(credentials_dict, items):
+    key = cache_key_for(credentials_dict)
+    try:
+        playlist_cache_collection.replace_one(
+            {"_id": key},
+            {"_id": key, "fetched_at": datetime.now(timezone.utc), "items": items},
+            upsert=True,
+        )
+    except Exception:
+        pass
+
+
+def invalidate_playlist_cache(credentials_dict):
+    try:
+        playlist_cache_collection.delete_one({"_id": cache_key_for(credentials_dict)})
+    except Exception:
+        pass
+
+
+def fetch_playlist_video_ids(youtube, playlist_id):
+    """Return the set of videoIds already in a playlist (1 unit per 50 items).
+
+    Used to skip inserts of videos already present, avoiding wasted 50-unit writes.
+    """
+    video_ids = set()
+    request_page = youtube.playlistItems().list(
+        part="contentDetails",
+        playlistId=playlist_id,
+        maxResults=50,
+    )
+    while request_page is not None:
+        response = request_page.execute()
+        record_api_call(endpoint="playlistItems.list", call_type="list")
+        for item in response.get("items", []):
+            video_id = (item.get("contentDetails") or {}).get("videoId")
+            if video_id:
+                video_ids.add(video_id)
+        request_page = youtube.playlistItems().list_next(request_page, response)
+    return video_ids
+
+
 def get_playlists(credentials_dict):
     youtube, _ = get_youtube_client(credentials_dict)
     playlists = []
@@ -263,7 +376,10 @@ def index():
         else:
             return render_template("index.html")
     try:
-        playlists = get_playlists(credentials)
+        playlists = get_cached_playlists(credentials)
+        if playlists is None:
+            playlists = get_playlists(credentials)
+            set_cached_playlists(credentials, playlists)
         sort_by = request.args.get("sort", "title")
         sort_order = request.args.get("order", "asc")
         if sort_by not in {"title", "count"}:
@@ -279,13 +395,8 @@ def index():
         for item in playlists
     )
     api_calls_today = get_api_calls_today()
-    try:
-        quota = int(API_CALL_QUOTA) if API_CALL_QUOTA else None
-    except ValueError:
-        quota = None
-    api_calls_remaining = None
-    if quota is not None:
-        api_calls_remaining = max(quota - api_calls_today, 0)
+    quota = get_quota_limit()
+    api_calls_remaining = max(quota - api_calls_today, 0)
     return render_template(
         "playlists.html",
         playlists=playlists,
@@ -307,6 +418,7 @@ def delete_playlist(playlist_id):
     try:
         youtube.playlists().delete(id=playlist_id).execute()
         record_api_call(endpoint="playlists.delete", call_type="delete")
+        invalidate_playlist_cache(credentials)
     except Exception as exc:
         if request.headers.get("X-Requested-With") == "XMLHttpRequest":
             return {"error": str(exc)}, 400
@@ -328,14 +440,26 @@ def delete_bulk():
     if not isinstance(playlist_ids, list) or not playlist_ids:
         return {"error": "No playlists provided"}, 400
     youtube, _ = get_youtube_client(credentials)
+    budget = remaining_write_budget()
     failures = []
+    skipped = 0
     for playlist_id in playlist_ids:
+        if budget <= 0:
+            skipped += 1
+            continue
         try:
             youtube.playlists().delete(id=playlist_id).execute()
             record_api_call(endpoint="playlists.delete", call_type="delete")
+            budget -= 1
         except Exception as exc:
             failures.append({"id": playlist_id, "error": str(exc)})
-    return {"success": len(failures) == 0, "failures": failures}
+    invalidate_playlist_cache(credentials)
+    return {
+        "success": len(failures) == 0 and skipped == 0,
+        "failures": failures,
+        "skipped": skipped,
+        "quotaBlocked": skipped > 0,
+    }
 
 
 @app.route("/playlist/<playlist_id>/items")
@@ -354,13 +478,15 @@ def playlist_items(playlist_id):
     response = api_request.execute()
     record_api_call(endpoint="playlistItems.list", call_type="list")
     simplified = []
-    deleted_item_ids = []
+    dead_item_ids = []
     for item in response.get("items", []):
         snippet = item.get("snippet") or {}
         details = item.get("contentDetails") or {}
         title = snippet.get("title") or ""
         if title in ("Deleted video", "Private video"):
-            deleted_item_ids.append(item.get("id"))
+            # Report dead videos but DO NOT delete them here — deleting on a read
+            # path silently costs 50 units each. Cleanup is an explicit POST action.
+            dead_item_ids.append(item.get("id"))
             continue
         simplified.append(
             {
@@ -370,19 +496,65 @@ def playlist_items(playlist_id):
                 "thumbnail": ((snippet.get("thumbnails") or {}).get("default") or {}).get("url"),
             }
         )
-    # Auto-remove deleted/private videos from the playlist in the background
-    removed_count = 0
-    for pid in deleted_item_ids:
-        try:
-            youtube.playlistItems().delete(id=pid).execute()
-            record_api_call(endpoint="playlistItems.delete", call_type="delete")
-            removed_count += 1
-        except Exception:
-            pass
     return {
         "items": simplified,
         "nextPageToken": response.get("nextPageToken"),
-        "autoRemoved": removed_count,
+        "deadItemIds": dead_item_ids,
+        "deadCount": len(dead_item_ids),
+    }
+
+
+@app.route("/playlist/<playlist_id>/cleanup", methods=["POST"])
+def cleanup_playlist(playlist_id):
+    """Explicitly remove deleted/private videos. Each removal costs 50 units."""
+    credentials = session.get("credentials") or load_saved_credentials()
+    if not credentials:
+        return {"error": "Not authenticated"}, 401
+    payload = request.get_json(silent=True) or {}
+    item_ids = payload.get("item_ids")
+    youtube, _ = get_youtube_client(credentials)
+    # If the caller didn't supply specific IDs, scan the whole playlist for dead ones.
+    if not isinstance(item_ids, list) or not item_ids:
+        item_ids = []
+        request_page = youtube.playlistItems().list(
+            part="snippet",
+            playlistId=playlist_id,
+            maxResults=50,
+        )
+        while request_page is not None:
+            resp = request_page.execute()
+            record_api_call(endpoint="playlistItems.list", call_type="list")
+            for it in resp.get("items", []):
+                title = (it.get("snippet") or {}).get("title") or ""
+                if title in ("Deleted video", "Private video"):
+                    item_ids.append(it.get("id"))
+            request_page = youtube.playlistItems().list_next(request_page, resp)
+    budget = remaining_write_budget()
+    failures = []
+    removed_item_ids = []
+    skipped = 0
+    for item_id in item_ids:
+        if not item_id:
+            continue
+        if budget <= 0:
+            skipped += 1
+            continue
+        try:
+            youtube.playlistItems().delete(id=item_id).execute()
+            record_api_call(endpoint="playlistItems.delete", call_type="delete")
+            removed_item_ids.append(item_id)
+            budget -= 1
+        except Exception as exc:
+            failures.append({"id": item_id, "error": str(exc)})
+    if removed_item_ids:
+        invalidate_playlist_cache(credentials)
+    return {
+        "success": len(failures) == 0 and skipped == 0,
+        "removed": len(removed_item_ids),
+        "removedItemIds": removed_item_ids,
+        "skipped": skipped,
+        "quotaBlocked": skipped > 0,
+        "failures": failures,
     }
 
 
@@ -416,19 +588,32 @@ def dedupe_playlist(playlist_id):
         else:
             seen_video_ids.add(video_id)
     failures = []
+    removed_item_ids = []
+    budget = remaining_write_budget()
+    skipped = 0
     for item_id in duplicate_item_ids:
+        if budget <= 0:
+            skipped += 1
+            continue
         try:
             youtube.playlistItems().delete(id=item_id).execute()
             record_api_call(endpoint="playlistItems.delete", call_type="delete")
+            removed_item_ids.append(item_id)
+            budget -= 1
         except Exception as exc:
             failures.append({"id": item_id, "error": str(exc)})
-    removed_count = len(duplicate_item_ids) - len(failures)
+    removed_count = len(removed_item_ids)
     remaining_count = len(items) - removed_count
+    if removed_count:
+        invalidate_playlist_cache(credentials)
     return {
-        "success": len(failures) == 0,
+        "success": len(failures) == 0 and skipped == 0,
         "removed": removed_count,
+        "removedItemIds": removed_item_ids,
         "duplicates": len(duplicate_item_ids),
         "remaining": remaining_count,
+        "skipped": skipped,
+        "quotaBlocked": skipped > 0,
         "failures": failures,
     }
 
@@ -443,14 +628,26 @@ def delete_playlist_items_bulk(playlist_id):
     if not isinstance(item_ids, list) or not item_ids:
         return {"error": "No items provided"}, 400
     youtube, _ = get_youtube_client(credentials)
+    budget = remaining_write_budget()
     failures = []
+    skipped = 0
     for item_id in item_ids:
+        if budget <= 0:
+            skipped += 1
+            continue
         try:
             youtube.playlistItems().delete(id=item_id).execute()
             record_api_call(endpoint="playlistItems.delete", call_type="delete")
+            budget -= 1
         except Exception as exc:
             failures.append({"id": item_id, "error": str(exc)})
-    return {"success": len(failures) == 0, "failures": failures}
+    invalidate_playlist_cache(credentials)
+    return {
+        "success": len(failures) == 0 and skipped == 0,
+        "failures": failures,
+        "skipped": skipped,
+        "quotaBlocked": skipped > 0,
+    }
 
 
 @app.route("/playlist/<playlist_id>/items/transfer", methods=["POST"])
@@ -469,8 +666,12 @@ def transfer_playlist_items(playlist_id):
     if not isinstance(items, list) or not items:
         return {"error": "No items provided"}, 400
     youtube, _ = get_youtube_client(credentials)
+    # Skip inserting videos already present in the destination (saves 50 units each).
+    existing_video_ids = fetch_playlist_video_ids(youtube, destination_id)
+    budget = remaining_write_budget()
     failures = []
     added = 0
+    skipped = 0
     delete_after = []
     for item in items:
         if not isinstance(item, dict):
@@ -479,6 +680,14 @@ def transfer_playlist_items(playlist_id):
         playlist_item_id = item.get("playlistItemId")
         if not video_id:
             failures.append({"videoId": video_id, "error": "Missing videoId"})
+            continue
+        if video_id in existing_video_ids:
+            # Already in destination; no insert needed. Still remove from source on move.
+            if mode == "move" and playlist_item_id:
+                delete_after.append(playlist_item_id)
+            continue
+        if budget <= 0:
+            skipped += 1
             continue
         try:
             youtube.playlistItems().insert(
@@ -495,23 +704,33 @@ def transfer_playlist_items(playlist_id):
             ).execute()
             record_api_call(endpoint="playlistItems.insert", call_type="insert")
             added += 1
+            budget -= 1
+            existing_video_ids.add(video_id)
             if mode == "move" and playlist_item_id:
                 delete_after.append(playlist_item_id)
         except Exception as exc:
             failures.append({"videoId": video_id, "error": str(exc)})
-    removed = 0
+    removed_item_ids = []
     if mode == "move" and delete_after:
         for item_id in delete_after:
+            if budget <= 0:
+                skipped += 1
+                continue
             try:
                 youtube.playlistItems().delete(id=item_id).execute()
                 record_api_call(endpoint="playlistItems.delete", call_type="delete")
-                removed += 1
+                removed_item_ids.append(item_id)
+                budget -= 1
             except Exception as exc:
                 failures.append({"id": item_id, "error": str(exc)})
+    invalidate_playlist_cache(credentials)
     return {
-        "success": len(failures) == 0,
+        "success": len(failures) == 0 and skipped == 0,
         "added": added,
-        "removed": removed,
+        "removed": len(removed_item_ids),
+        "removedItemIds": removed_item_ids,
+        "skipped": skipped,
+        "quotaBlocked": skipped > 0,
         "failures": failures,
     }
 
@@ -532,10 +751,16 @@ def merge_playlists():
     if new_name is not None and not new_name:
         return {"error": "New name is required"}, 400
     youtube, _ = get_youtube_client(credentials)
+    # Skip inserting videos already present in the target (saves 50 units each).
+    existing_video_ids = fetch_playlist_video_ids(youtube, target_id)
+    budget = remaining_write_budget()
 
     failures = []
     added = 0
+    skipped = 0
+    source_fully_merged = {}
     for playlist_id in source_ids:
+        ok = True
         request_page = youtube.playlistItems().list(
             part="contentDetails",
             playlistId=playlist_id,
@@ -547,6 +772,12 @@ def merge_playlists():
             for item in response.get("items", []):
                 video_id = (item.get("contentDetails") or {}).get("videoId")
                 if not video_id:
+                    continue
+                if video_id in existing_video_ids:
+                    continue
+                if budget <= 0:
+                    skipped += 1
+                    ok = False
                     continue
                 try:
                     youtube.playlistItems().insert(
@@ -563,28 +794,48 @@ def merge_playlists():
                     ).execute()
                     record_api_call(endpoint="playlistItems.insert", call_type="insert")
                     added += 1
+                    budget -= 1
+                    existing_video_ids.add(video_id)
                 except Exception as exc:
                     failures.append({"playlist_id": playlist_id, "video_id": video_id, "error": str(exc)})
+                    ok = False
             request_page = youtube.playlistItems().list_next(request_page, response)
+        source_fully_merged[playlist_id] = ok
 
+    # Only delete a source whose videos were ALL copied — never lose videos that
+    # didn't make it across (e.g. when the daily quota budget ran out).
     for playlist_id in source_ids:
+        if not source_fully_merged.get(playlist_id):
+            continue
+        if budget <= 0:
+            skipped += 1
+            continue
         try:
             youtube.playlists().delete(id=playlist_id).execute()
             record_api_call(endpoint="playlists.delete", call_type="delete")
+            budget -= 1
         except Exception as exc:
             failures.append({"playlist_id": playlist_id, "error": str(exc)})
 
-    if new_name:
+    if new_name and budget > 0:
         try:
             youtube.playlists().update(
                 part="snippet",
                 body={"id": target_id, "snippet": {"title": new_name}},
             ).execute()
             record_api_call(endpoint="playlists.update", call_type="update")
+            budget -= 1
         except Exception as exc:
             failures.append({"playlist_id": target_id, "error": str(exc)})
 
-    return {"success": len(failures) == 0, "failures": failures, "added": added}
+    invalidate_playlist_cache(credentials)
+    return {
+        "success": len(failures) == 0 and skipped == 0,
+        "failures": failures,
+        "added": added,
+        "skipped": skipped,
+        "quotaBlocked": skipped > 0,
+    }
 
 
 @app.route("/playlist/<playlist_id>/rename", methods=["POST"])
@@ -600,22 +851,33 @@ def rename_playlist(playlist_id):
         return {"error": "New name is required"}, 400
     youtube, _ = get_youtube_client(credentials)
     try:
-        # Fetch existing snippet so we preserve description and other fields
-        existing = youtube.playlists().list(
-            part="snippet",
-            id=playlist_id,
-        ).execute()
-        record_api_call(endpoint="playlists.list", call_type="list")
-        items = existing.get("items", [])
-        if not items:
-            return {"error": "Playlist not found"}, 404
-        current_snippet = items[0].get("snippet", {})
+        # Preserve description and other snippet fields (update with part="snippet"
+        # overwrites the whole snippet). Reuse the cached playlist snippet if we
+        # have it, falling back to a 1-unit list read only when the cache is cold.
+        current_snippet = None
+        cached = get_cached_playlists(credentials)
+        if cached:
+            for playlist in cached:
+                if playlist.get("id") == playlist_id:
+                    current_snippet = dict(playlist.get("snippet") or {})
+                    break
+        if current_snippet is None:
+            existing = youtube.playlists().list(
+                part="snippet",
+                id=playlist_id,
+            ).execute()
+            record_api_call(endpoint="playlists.list", call_type="list")
+            items = existing.get("items", [])
+            if not items:
+                return {"error": "Playlist not found"}, 404
+            current_snippet = items[0].get("snippet", {})
         current_snippet["title"] = new_name
         youtube.playlists().update(
             part="snippet",
             body={"id": playlist_id, "snippet": current_snippet},
         ).execute()
         record_api_call(endpoint="playlists.update", call_type="update")
+        invalidate_playlist_cache(credentials)
     except Exception as exc:
         return {"error": str(exc)}, 400
     return {"success": True, "name": new_name}
@@ -631,10 +893,21 @@ def import_videos(playlist_id):
     if not isinstance(video_ids, list) or not video_ids:
         return {"error": "No video IDs provided"}, 400
     youtube, _ = get_youtube_client(credentials)
+    # Skip videos already present in the destination (saves 50 units each).
+    existing_video_ids = fetch_playlist_video_ids(youtube, playlist_id)
+    budget = remaining_write_budget()
     failures = []
     added = 0
+    already_present = 0
+    skipped = 0
     for video_id in video_ids:
         if not video_id or not isinstance(video_id, str):
+            continue
+        if video_id in existing_video_ids:
+            already_present += 1
+            continue
+        if budget <= 0:
+            skipped += 1
             continue
         try:
             youtube.playlistItems().insert(
@@ -651,9 +924,20 @@ def import_videos(playlist_id):
             ).execute()
             record_api_call(endpoint="playlistItems.insert", call_type="insert")
             added += 1
+            budget -= 1
+            existing_video_ids.add(video_id)
         except Exception as exc:
             failures.append({"videoId": video_id, "error": str(exc)})
-    return {"success": len(failures) == 0, "added": added, "failures": failures}
+    if added:
+        invalidate_playlist_cache(credentials)
+    return {
+        "success": len(failures) == 0 and skipped == 0,
+        "added": added,
+        "alreadyPresent": already_present,
+        "skipped": skipped,
+        "quotaBlocked": skipped > 0,
+        "failures": failures,
+    }
 
 
 @app.route("/login")
