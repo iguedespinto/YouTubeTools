@@ -8,12 +8,12 @@
   <div class="meta">
     Total playlists: <span id="total-playlists">{{ total_playlists }}</span>
     · Total videos: <span id="total-videos">{{ total_videos }}</span>
-    · API calls used (today): <span id="api-calls-today">{{ api_calls_used }}</span>
+    · Quota units used (today): <span id="api-calls-today">{{ api_calls_used }}</span>
     {% if api_calls_remaining is not none %}
-      · Estimated remaining: <span id="api-calls-remaining">{{ api_calls_remaining }}</span>
+      · Estimated units remaining: <span id="api-calls-remaining">{{ api_calls_remaining }}</span>
     {% endif %}
   </div>
-  <form method="get">
+  <div class="sort-controls">
     <div class="actions">
       <label>
         Sort by
@@ -29,7 +29,7 @@
           <option value="desc" {% if sort_order == "desc" %}selected{% endif %}>Descending</option>
         </select>
       </label>
-      <button class="btn" type="submit">Apply</button>
+      <button class="btn" type="button" id="apply-sort">Apply</button>
     </div>
     <div class="actions">
       <label>
@@ -44,7 +44,7 @@
         <input type="text" id="playlist-search" placeholder="Type to filter playlists">
       </label>
     </div>
-  </form>
+  </div>
   {% if playlists %}
     <div class="playlist-layout">
       <div class="playlist-list-pane">
@@ -103,6 +103,7 @@
             <button class="btn secondary" type="button" id="copy-selected-videos" disabled>Copy selected</button>
             <button class="btn secondary" type="button" id="move-selected-videos" disabled>Move selected</button>
             <button class="btn danger" type="button" id="delete-selected-videos" disabled>Delete selected videos</button>
+            <button class="btn secondary" type="button" id="cleanup-dead-button" style="display: none;"></button>
             <button class="btn secondary" type="button" id="import-videos-button">Import videos</button>
           </div>
         </div>
@@ -183,7 +184,7 @@
       return _originalFetch.apply(this, args).then((response) => {
         const origJson = response.json.bind(response);
         response.json = () => origJson().then((data) => {
-          if (data && typeof data === 'object' && typeof data.apiCallsToday !== 'undefined') {
+          if (data && typeof data === 'object' && typeof data.quotaUnitsToday !== 'undefined') {
             updateApiStats(data);
           }
           return data;
@@ -258,13 +259,81 @@
       updateViewerInfo();
     }
 
-    function handleAutoRemoved(playlistId, data) {
-      const removed = data.autoRemoved || 0;
-      if (removed > 0) {
-        updatePlaylistCount(playlistId, -removed);
-        updateTotalVideos(-removed);
-        updateViewerInfo();
+    const cleanupDeadButton = document.getElementById('cleanup-dead-button');
+
+    /* Track deleted/private videos reported by the read endpoint (no longer
+       auto-deleted server-side) so the user can clean them up explicitly. */
+    function accumulateDead(playlistId, data) {
+      const cached = videoCache[playlistId];
+      if (!cached) return;
+      const ids = data.deadItemIds || [];
+      if (ids.length) {
+        const merged = new Set(cached.deadItemIds || []);
+        ids.forEach((id) => { if (id) merged.add(id); });
+        cached.deadItemIds = Array.from(merged);
       }
+      if (currentPlaylistId === playlistId) updateCleanupBar(playlistId);
+    }
+
+    function updateCleanupBar(playlistId) {
+      if (!cleanupDeadButton) return;
+      const cached = videoCache[playlistId];
+      const count = cached && cached.deadItemIds ? cached.deadItemIds.length : 0;
+      if (count > 0 && currentPlaylistId === playlistId) {
+        cleanupDeadButton.style.display = 'inline-block';
+        cleanupDeadButton.disabled = false;
+        cleanupDeadButton.textContent = `Clean up ${count} unavailable video(s) (~${count * 50} units)`;
+      } else {
+        cleanupDeadButton.style.display = 'none';
+      }
+    }
+
+    /* When a guard-railed write stops early to avoid exceeding the daily quota,
+       reload so the UI reflects the true server state instead of guessing. */
+    function handleQuotaBlocked(data) {
+      if (data && data.quotaBlocked) {
+        alert('Daily YouTube API quota budget reached. The operation stopped early to avoid exceeding your limit. Reloading to show the current state.');
+        window.location.reload();
+        return true;
+      }
+      return false;
+    }
+
+    if (cleanupDeadButton) {
+      cleanupDeadButton.addEventListener('click', () => {
+        const playlistId = currentPlaylistId;
+        if (!playlistId) return;
+        const cached = videoCache[playlistId];
+        const ids = cached && cached.deadItemIds ? cached.deadItemIds.slice() : [];
+        if (!ids.length) return;
+        if (!confirm(`Remove ${ids.length} unavailable (deleted/private) video(s)? This costs ~${ids.length * 50} quota units.`)) return;
+        cleanupDeadButton.disabled = true;
+        cleanupDeadButton.textContent = 'Cleaning up...';
+        fetch(`/playlist/${playlistId}/cleanup`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+          body: JSON.stringify({ item_ids: ids }),
+        })
+          .then((response) => response.json())
+          .then((data) => {
+            const removed = data.removed || 0;
+            const removedIds = new Set(data.removedItemIds || []);
+            if (cached) {
+              cached.deadItemIds = (cached.deadItemIds || []).filter((id) => !removedIds.has(id));
+            }
+            if (removed > 0) {
+              updatePlaylistCount(playlistId, -removed);
+              updateTotalVideos(-removed);
+            }
+            if (data.quotaBlocked) {
+              alert('Daily quota budget reached — some unavailable videos were not removed. Try again tomorrow.');
+            } else if (data.failures && data.failures.length) {
+              alert('Some videos could not be removed.');
+            }
+          })
+          .catch(() => alert('Failed to clean up videos.'))
+          .finally(() => { updateCleanupBar(playlistId); });
+      });
     }
 
     function prefetchNextPage(playlistId) {
@@ -280,7 +349,7 @@
           if (!c) return;
           c.prefetchedItems = data.items || [];
           c.prefetchedNextPageToken = data.nextPageToken || null;
-          handleAutoRemoved(playlistId, data);
+          accumulateDead(playlistId, data);
         })
         .catch(() => { /* silently fail */ })
         .finally(() => { isPrefetching = false; });
@@ -330,7 +399,7 @@
             });
           }
           updateViewerInfo();
-          handleAutoRemoved(playlistId, data);
+          accumulateDead(playlistId, data);
           /* Prefetch the next page */
           prefetchNextPage(playlistId);
         })
@@ -422,6 +491,7 @@
     function loadPlaylistVideos(playlistId, playlistTitle, rowElement) {
       if (!playlistId) return;
       currentPlaylistId = playlistId;
+      if (cleanupDeadButton) cleanupDeadButton.style.display = 'none';
       if (viewerTitle && playlistTitle) {
         viewerTitle.textContent = `Playlist videos: ${playlistTitle}`;
       }
@@ -443,6 +513,7 @@
         renderCachedItems(playlistId);
         setupInfiniteScroll(playlistId);
         prefetchNextPage(playlistId);
+        updateCleanupBar(playlistId);
         return;
       }
 
@@ -455,10 +526,11 @@
           videoCache[playlistId] = {
             items: items,
             nextPageToken: data.nextPageToken || null,
+            deadItemIds: data.deadItemIds || [],
           };
           renderCachedItems(playlistId);
           setupInfiniteScroll(playlistId);
-          handleAutoRemoved(playlistId, data);
+          accumulateDead(playlistId, data);
           /* Immediately prefetch second page so first view has 100 records ready */
           prefetchNextPage(playlistId);
         })
@@ -592,7 +664,7 @@
         const li = button.closest('li');
         const playlistId = li?.dataset.playlistId || button.dataset.playlistId;
         if (!playlistId) return;
-        if (!confirm('Remove duplicate videos from this playlist?')) return;
+        if (!confirm('Remove duplicate videos from this playlist? Each duplicate removed costs ~50 quota units.')) return;
         const statusEl = li ? li.querySelector('.dedupe-status') : null;
         button.disabled = true;
         const originalLabel = button.textContent;
@@ -629,10 +701,17 @@
                 totalVideosEl.textContent = `${Math.max(currentTotal - removedCount, 0)}`;
               }
             }
-            delete videoCache[playlistId];
+            const removedIds = new Set(data.removedItemIds || []);
+            if (videoCache[playlistId] && removedIds.size) {
+              videoCache[playlistId].items = videoCache[playlistId].items
+                .filter((item) => !removedIds.has(item.playlistItemId));
+            }
             if (currentPlaylistId === playlistId) {
-              const title = li ? li.querySelector('.playlist-link')?.textContent?.trim() : '';
-              loadPlaylistVideos(playlistId, title, li);
+              renderCachedItems(playlistId);
+              updateCleanupBar(playlistId);
+            }
+            if (data.quotaBlocked) {
+              alert('Daily quota budget reached — not all duplicates were removed. Try again tomorrow.');
             }
             if (statusEl) {
               if (data.failures && data.failures.length) {
@@ -693,6 +772,33 @@
       });
     }
 
+    /* Sort entirely client-side by reordering the existing rows — no API call.
+       Each row already carries data-count and the title via .playlist-link. */
+    const sortSelect = document.querySelector('select[name="sort"]');
+    const orderSelect = document.querySelector('select[name="order"]');
+    const applySortButton = document.getElementById('apply-sort');
+    function applyPlaylistSort() {
+      if (!playlistList) return;
+      const by = sortSelect ? sortSelect.value : 'title';
+      const reverse = (orderSelect ? orderSelect.value : 'asc') === 'desc';
+      const rows = Array.from(playlistList.querySelectorAll('li'));
+      rows.sort((a, b) => {
+        let cmp;
+        if (by === 'count') {
+          cmp = (parseInt(a.dataset.count || '0', 10)) - (parseInt(b.dataset.count || '0', 10));
+        } else {
+          const ta = (a.querySelector('.playlist-link')?.dataset.title || '').toLowerCase();
+          const tb = (b.querySelector('.playlist-link')?.dataset.title || '').toLowerCase();
+          cmp = ta < tb ? -1 : ta > tb ? 1 : 0;
+        }
+        return reverse ? -cmp : cmp;
+      });
+      rows.forEach((row) => playlistList.appendChild(row));
+    }
+    if (applySortButton) {
+      applySortButton.addEventListener('click', applyPlaylistSort);
+    }
+
     function collectSelectedVideoItems() {
       return Array.from(viewer.querySelectorAll('.video-select:checked'))
         .map((checkbox) => checkbox.closest('li'))
@@ -731,8 +837,8 @@
     }
 
     function updateApiStats(data) {
-      if (!data || typeof data.apiCallsToday === 'undefined') return;
-      const count = data.apiCallsToday;
+      if (!data || typeof data.quotaUnitsToday === 'undefined') return;
+      const count = data.quotaUnitsToday;
       if (apiCallsTodayEl) apiCallsTodayEl.textContent = `${count}`;
       if (apiCallsRemainingEl && initialApiQuota !== null) {
         apiCallsRemainingEl.textContent = `${Math.max(initialApiQuota - count, 0)}`;
@@ -743,7 +849,7 @@
       deleteSelectedVideosButton.addEventListener('click', () => {
         const selectedItems = collectSelectedVideoItems();
         if (!selectedItems.length || !currentPlaylistId) return;
-        if (!confirm(`Remove ${selectedItems.length} video(s) from this playlist?`)) return;
+        if (!confirm(`Remove ${selectedItems.length} video(s) from this playlist? (~${selectedItems.length * 50} quota units)`)) return;
         deleteSelectedVideosButton.disabled = true;
         const originalLabel = deleteSelectedVideosButton.textContent;
         deleteSelectedVideosButton.textContent = 'Deleting...';
@@ -761,6 +867,7 @@
         })
           .then((response) => response.json())
           .then((data) => {
+            if (handleQuotaBlocked(data)) return;
             if (!data.success && data.failures && data.failures.length) {
               const failedIds = new Set(data.failures.map((item) => item.id));
               selectedItems.forEach((item) => {
@@ -817,7 +924,8 @@
       const destinationId = transferDestinationSelect?.value;
       if (!destinationId) return;
       const actionLabel = mode === 'move' ? 'Move' : 'Copy';
-      if (!confirm(`${actionLabel} ${selectedItems.length} video(s) to the selected playlist?`)) return;
+      const estUnits = mode === 'move' ? selectedItems.length * 100 : selectedItems.length * 50;
+      if (!confirm(`${actionLabel} ${selectedItems.length} video(s) to the selected playlist? (~${estUnits} quota units${mode === 'move' ? '; move costs 2× copy' : ''}; videos already in the destination are skipped)`)) return;
       const button = mode === 'move' ? moveSelectedVideosButton : copySelectedVideosButton;
       if (!button) return;
       button.disabled = true;
@@ -844,20 +952,21 @@
       })
         .then((response) => response.json())
         .then((data) => {
+          if (handleQuotaBlocked(data)) return;
           if (!data.success && data.failures && data.failures.length) {
             alert('Some videos could not be transferred.');
           }
           const added = data.added || 0;
           const removed = data.removed || 0;
           delete videoCache[destinationId];
-          if (mode === 'move' && removed) {
+          const movedIds = new Set(data.removedItemIds || []);
+          if (mode === 'move' && movedIds.size) {
             selectedItems.forEach((item) => {
-              if (item.playlistItemId) {
+              if (item.playlistItemId && movedIds.has(item.playlistItemId)) {
                 item.li.remove();
               }
             });
             if (videoCache[currentPlaylistId]) {
-              const movedIds = new Set(selectedItems.map((item) => item.playlistItemId).filter(Boolean));
               videoCache[currentPlaylistId].items = videoCache[currentPlaylistId].items
                 .filter((item) => !movedIds.has(item.playlistItemId));
             }
@@ -900,7 +1009,7 @@
     document.querySelectorAll('.delete-form').forEach((form) => {
       form.addEventListener('submit', (event) => {
         event.preventDefault();
-        if (!confirm('Delete this playlist?')) return;
+        if (!confirm('Delete this playlist? (~50 quota units)')) return;
         fetch(form.action, {
           method: 'POST',
           headers: { 'X-Requested-With': 'XMLHttpRequest' },
@@ -968,7 +1077,7 @@
           .map((checkbox) => checkbox.closest('li'))
           .filter(Boolean);
         if (!selected.length) return;
-        if (!confirm(`Delete ${selected.length} playlist(s)?`)) return;
+        if (!confirm(`Delete ${selected.length} playlist(s)? (~${selected.length * 50} quota units)`)) return;
         bulkDeleteButton.disabled = true;
         const originalLabel = bulkDeleteButton.textContent;
         const total = selected.length;
@@ -1034,6 +1143,12 @@
         .sort((a, b) => b.count - a.count);
       const target = sorted[0];
       const sources = sorted.slice(1);
+      const estMergeVideos = sources.reduce((sum, item) => sum + (item.count || 0), 0);
+      const estMergeUnits = estMergeVideos * 50 + sources.length * 50;
+      if (!confirm(`Merge ${selected.length} playlists? This copies up to ${estMergeVideos} video(s) and deletes ${sources.length} playlist(s) — up to ~${estMergeUnits} quota units (videos already in the target are skipped).`)) {
+        if (mergeStatus) mergeStatus.textContent = '';
+        return;
+      }
       mergeSelectedButton.disabled = true;
       const originalLabel = mergeSelectedButton.textContent;
       mergeSelectedButton.textContent = 'Merging...';
@@ -1043,6 +1158,7 @@
         mergeStatus.textContent = `Transferring: ${transferred} of ${totalToTransfer}`;
       }
       let hasFailures = false;
+      let addedTotal = 0;
       for (let i = 0; i < sources.length; i += 1) {
         const source = sources[i];
         const isLast = i === sources.length - 1;
@@ -1060,12 +1176,21 @@
             }),
           });
           const data = await response.json();
-          if (!data.success && data.failures && data.failures.length) {
+          if (data.quotaBlocked) {
+            alert('Daily quota budget reached during merge. Stopping and reloading to show the current state.');
+            window.location.reload();
+            return;
+          }
+          addedTotal += data.added || 0;
+          if (data.success) {
+            /* Source was fully merged AND deleted server-side — safe to remove. */
+            delete videoCache[source.id];
+            source.li.remove();
+            updateTotalPlaylists(-1);
+          } else {
+            /* Server kept the source (partial merge/failure) — leave it visible. */
             hasFailures = true;
           }
-          delete videoCache[source.id];
-          source.li.remove();
-          updateTotalPlaylists(-1);
         } catch {
           hasFailures = true;
         }
@@ -1078,7 +1203,7 @@
       if (hasFailures) {
         alert('Some playlists could not be merged.');
       }
-      const newCount = sorted.reduce((sum, item) => sum + (item.count || 0), 0);
+      const newCount = (target.count || 0) + addedTotal;
       target.li.dataset.count = `${newCount}`;
       const metaEl = target.li.querySelector('.meta');
       if (metaEl) metaEl.textContent = `${newCount} videos`;
@@ -1230,6 +1355,10 @@
           return;
         }
 
+        if (!confirm(`Import ${videoIds.length} video(s)? This costs up to ~${videoIds.length * 50} quota units (videos already present are skipped).`)) {
+          return;
+        }
+
         importSubmitButton.disabled = true;
         const originalLabel = importSubmitButton.textContent;
         importSubmitButton.textContent = 'Importing...';
@@ -1248,7 +1377,11 @@
           if (data.success) {
             const added = data.added || 0;
             const failures = data.failures || [];
+            const alreadyPresent = data.alreadyPresent || 0;
             let msg = `Successfully added ${added} video(s).`;
+            if (alreadyPresent) {
+              msg += ` ${alreadyPresent} already present (skipped).`;
+            }
             if (failures.length) {
               msg += ` ${failures.length} failed.`;
             }
@@ -1271,6 +1404,12 @@
             /* Clear the textarea after success */
             if (importTextarea) importTextarea.value = '';
             if (importFile) importFile.value = '';
+          } else if (data.quotaBlocked) {
+            const added = data.added || 0;
+            if (importStatus) importStatus.textContent = `Added ${added} video(s), then stopped: daily quota budget reached. Try the rest tomorrow.`;
+            delete videoCache[destId];
+            updatePlaylistCount(destId, added);
+            updateTotalVideos(added);
           } else {
             if (importStatus) importStatus.textContent = data.error || 'Import failed.';
           }
