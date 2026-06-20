@@ -819,7 +819,15 @@ def merge_playlists():
         return {"error": "New name is required"}, 400
     youtube, _ = get_youtube_client(credentials)
     # Skip inserting videos already present in the target (saves 50 units each).
-    existing_video_ids = fetch_playlist_video_ids(youtube, target_id)
+    try:
+        existing_video_ids = fetch_playlist_video_ids(youtube, target_id)
+    except Exception as exc:
+        return {
+            "success": False,
+            "added": 0,
+            "failures": [{"playlist_id": target_id,
+                          "error": "Target playlist could not be read: " + str(exc)}],
+        }
     budget = remaining_write_budget()
 
     failures = []
@@ -829,46 +837,54 @@ def merge_playlists():
     source_fully_merged = {}
     for playlist_id in source_ids:
         ok = True
-        request_page = youtube.playlistItems().list(
-            part="contentDetails",
-            playlistId=playlist_id,
-            maxResults=50,
-        )
-        while request_page is not None:
-            response = request_page.execute()
-            record_api_call(endpoint="playlistItems.list", call_type="list")
-            for item in response.get("items", []):
-                video_id = (item.get("contentDetails") or {}).get("videoId")
-                if not video_id:
-                    continue
-                if video_id in existing_video_ids:
-                    already_present += 1
-                    continue
-                if budget <= 0:
-                    skipped += 1
-                    ok = False
-                    continue
-                try:
-                    youtube.playlistItems().insert(
-                        part="snippet",
-                        body={
-                            "snippet": {
-                                "playlistId": target_id,
-                                "resourceId": {
-                                    "kind": "youtube#video",
-                                    "videoId": video_id,
-                                },
-                            }
-                        },
-                    ).execute()
-                    record_api_call(endpoint="playlistItems.insert", call_type="insert")
-                    added += 1
-                    budget -= 1
-                    existing_video_ids.add(video_id)
-                except Exception as exc:
-                    failures.append({"playlist_id": playlist_id, "video_id": video_id, "error": str(exc)})
-                    ok = False
-            request_page = youtube.playlistItems().list_next(request_page, response)
+        try:
+            request_page = youtube.playlistItems().list(
+                part="contentDetails",
+                playlistId=playlist_id,
+                maxResults=50,
+            )
+            while request_page is not None:
+                response = request_page.execute()
+                record_api_call(endpoint="playlistItems.list", call_type="list")
+                for item in response.get("items", []):
+                    video_id = (item.get("contentDetails") or {}).get("videoId")
+                    if not video_id:
+                        continue
+                    if video_id in existing_video_ids:
+                        already_present += 1
+                        continue
+                    if budget <= 0:
+                        skipped += 1
+                        ok = False
+                        continue
+                    try:
+                        youtube.playlistItems().insert(
+                            part="snippet",
+                            body={
+                                "snippet": {
+                                    "playlistId": target_id,
+                                    "resourceId": {
+                                        "kind": "youtube#video",
+                                        "videoId": video_id,
+                                    },
+                                }
+                            },
+                        ).execute()
+                        record_api_call(endpoint="playlistItems.insert", call_type="insert")
+                        added += 1
+                        budget -= 1
+                        existing_video_ids.add(video_id)
+                    except Exception as exc:
+                        failures.append({"playlist_id": playlist_id, "video_id": video_id, "error": str(exc)})
+                        ok = False
+                request_page = youtube.playlistItems().list_next(request_page, response)
+        except Exception as exc:
+            # Source playlist could not be read (e.g. deleted / not found). Skip it
+            # instead of 500-ing the whole merge, and never delete a source we
+            # couldn't fully read.
+            failures.append({"playlist_id": playlist_id,
+                             "error": "Could not read playlist: " + str(exc)})
+            ok = False
         source_fully_merged[playlist_id] = ok
 
     # Only delete a source whose videos were ALL copied — never lose videos that

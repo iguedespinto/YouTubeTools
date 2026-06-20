@@ -1200,6 +1200,7 @@
       }
       let hasFailures = false;
       let addedTotal = 0;
+      const mergeFailureMessages = new Set();
       for (let i = 0; i < sources.length; i += 1) {
         const source = sources[i];
         const isLast = i === sources.length - 1;
@@ -1231,9 +1232,13 @@
           } else {
             /* Server kept the source (partial merge/failure) — leave it visible. */
             hasFailures = true;
+            (data.failures || []).forEach((f) => {
+              if (f && f.error) mergeFailureMessages.add(f.error);
+            });
           }
         } catch {
           hasFailures = true;
+          mergeFailureMessages.add('The request failed (a selected playlist may have been deleted or is unreadable).');
         }
         transferred += source.count || 0;
         if (mergeStatus) {
@@ -1242,7 +1247,8 @@
       }
       delete videoCache[target.id];
       if (hasFailures) {
-        alert('Some playlists could not be merged.');
+        const details = Array.from(mergeFailureMessages).slice(0, 3).join('\n\n');
+        alert('Some playlists could not be merged.' + (details ? '\n\n' + details : ''));
       }
       const newCount = (target.count || 0) + addedTotal;
       target.li.dataset.count = `${newCount}`;
