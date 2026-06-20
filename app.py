@@ -51,6 +51,17 @@ WRITE_UNIT_COST = 50
 # How long to cache the user's playlist list server-side before refetching.
 PLAYLIST_CACHE_TTL_SECONDS = int(os.getenv("YT_PLAYLIST_CACHE_TTL", "300"))
 
+# Playlists to hide from the UI. "PLPs83dPIe4l4" is a YouTube "ghost" playlist:
+# it appears in playlists.list(mine=True) but cannot be opened or deleted
+# ("The playlist does not exist"), so we filter it out. Add more (comma/space
+# separated) via the YT_IGNORE_PLAYLISTS env var.
+IGNORED_PLAYLIST_IDS = {"PLPs83dPIe4l4"} | {
+    pid.strip()
+    for chunk in os.getenv("YT_IGNORE_PLAYLISTS", "").split(",")
+    for pid in chunk.split()
+    if pid.strip()
+}
+
 MONGODB_CONNECTION_STRING = os.getenv("MONGODB_CONNECTION_STRING")
 mongo_client = MongoClient(MONGODB_CONNECTION_STRING)
 mongo_db = mongo_client.get_default_database()
@@ -435,6 +446,8 @@ def index():
             # Served from cache — record the playlists.list calls we avoided.
             pages = max(1, (len(playlists) + 49) // 50)
             record_savings("cache", pages, pages)
+        if IGNORED_PLAYLIST_IDS:
+            playlists = [p for p in playlists if p.get("id") not in IGNORED_PLAYLIST_IDS]
         sort_by = request.args.get("sort", "title")
         sort_order = request.args.get("order", "asc")
         if sort_by not in {"title", "count"}:
