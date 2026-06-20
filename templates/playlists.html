@@ -529,6 +529,14 @@
         .then((response) => response.json())
         .then((data) => {
           if (currentPlaylistId !== playlistId) return;
+          if (data.error) {
+            const hint = document.createElement('div');
+            hint.className = 'viewer-hint';
+            hint.textContent = data.error;
+            viewer.innerHTML = '';
+            viewer.appendChild(hint);
+            return;
+          }
           const items = data.items || [];
           videoCache[playlistId] = {
             items: items,

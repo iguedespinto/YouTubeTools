@@ -537,7 +537,16 @@ def playlist_items(playlist_id):
         maxResults=50,
         pageToken=page_token,
     )
-    response = api_request.execute()
+    try:
+        response = api_request.execute()
+    except Exception as exc:
+        return {
+            "items": [],
+            "nextPageToken": None,
+            "deadItemIds": [],
+            "deadCount": 0,
+            "error": "This playlist could not be read (it may have been deleted): " + str(exc),
+        }
     record_api_call(endpoint="playlistItems.list", call_type="list")
     simplified = []
     dead_item_ids = []
@@ -578,19 +587,30 @@ def cleanup_playlist(playlist_id):
     # If the caller didn't supply specific IDs, scan the whole playlist for dead ones.
     if not isinstance(item_ids, list) or not item_ids:
         item_ids = []
-        request_page = youtube.playlistItems().list(
-            part="snippet",
-            playlistId=playlist_id,
-            maxResults=50,
-        )
-        while request_page is not None:
-            resp = request_page.execute()
-            record_api_call(endpoint="playlistItems.list", call_type="list")
-            for it in resp.get("items", []):
-                title = (it.get("snippet") or {}).get("title") or ""
-                if title in ("Deleted video", "Private video"):
-                    item_ids.append(it.get("id"))
-            request_page = youtube.playlistItems().list_next(request_page, resp)
+        try:
+            request_page = youtube.playlistItems().list(
+                part="snippet",
+                playlistId=playlist_id,
+                maxResults=50,
+            )
+            while request_page is not None:
+                resp = request_page.execute()
+                record_api_call(endpoint="playlistItems.list", call_type="list")
+                for it in resp.get("items", []):
+                    title = (it.get("snippet") or {}).get("title") or ""
+                    if title in ("Deleted video", "Private video"):
+                        item_ids.append(it.get("id"))
+                request_page = youtube.playlistItems().list_next(request_page, resp)
+        except Exception as exc:
+            return {
+                "success": False,
+                "removed": 0,
+                "removedItemIds": [],
+                "skipped": 0,
+                "quotaBlocked": False,
+                "failures": [],
+                "error": "This playlist could not be read (it may have been deleted): " + str(exc),
+            }
     budget = remaining_write_budget()
     failures = []
     removed_item_ids = []
@@ -627,16 +647,22 @@ def dedupe_playlist(playlist_id):
         return {"error": "Not authenticated"}, 401
     youtube, _ = get_youtube_client(credentials)
     items = []
-    request_page = youtube.playlistItems().list(
-        part="contentDetails",
-        playlistId=playlist_id,
-        maxResults=50,
-    )
-    while request_page is not None:
-        response = request_page.execute()
-        record_api_call(endpoint="playlistItems.list", call_type="list")
-        items.extend(response.get("items", []))
-        request_page = youtube.playlistItems().list_next(request_page, response)
+    try:
+        request_page = youtube.playlistItems().list(
+            part="contentDetails",
+            playlistId=playlist_id,
+            maxResults=50,
+        )
+        while request_page is not None:
+            response = request_page.execute()
+            record_api_call(endpoint="playlistItems.list", call_type="list")
+            items.extend(response.get("items", []))
+            request_page = youtube.playlistItems().list_next(request_page, response)
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": "This playlist could not be read (it may have been deleted): " + str(exc),
+        }
     seen_video_ids = set()
     duplicate_item_ids = []
     for item in items:
@@ -729,7 +755,16 @@ def transfer_playlist_items(playlist_id):
         return {"error": "No items provided"}, 400
     youtube, _ = get_youtube_client(credentials)
     # Skip inserting videos already present in the destination (saves 50 units each).
-    existing_video_ids = fetch_playlist_video_ids(youtube, destination_id)
+    try:
+        existing_video_ids = fetch_playlist_video_ids(youtube, destination_id)
+    except Exception as exc:
+        return {
+            "success": False,
+            "added": 0,
+            "removed": 0,
+            "failures": [{"error": "Destination playlist could not be read "
+                                   "(it may have been deleted): " + str(exc)}],
+        }
     budget = remaining_write_budget()
     failures = []
     added = 0
@@ -982,7 +1017,15 @@ def import_videos(playlist_id):
         return {"error": "No video IDs provided"}, 400
     youtube, _ = get_youtube_client(credentials)
     # Skip videos already present in the destination (saves 50 units each).
-    existing_video_ids = fetch_playlist_video_ids(youtube, playlist_id)
+    try:
+        existing_video_ids = fetch_playlist_video_ids(youtube, playlist_id)
+    except Exception as exc:
+        return {
+            "success": False,
+            "added": 0,
+            "error": "Destination playlist could not be read "
+                     "(it may have been deleted): " + str(exc),
+        }
     budget = remaining_write_budget()
     failures = []
     added = 0
