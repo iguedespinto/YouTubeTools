@@ -882,6 +882,7 @@ def merge_playlists():
     added = 0
     skipped = 0
     already_present = 0
+    unavailable = 0  # ghost playlists / deleted videos — nothing the user can fix
     source_fully_merged = {}
     for playlist_id in source_ids:
         ok = True
@@ -923,15 +924,26 @@ def merge_playlists():
                         budget -= 1
                         existing_video_ids.add(video_id)
                     except Exception as exc:
-                        failures.append({"playlist_id": playlist_id, "video_id": video_id, "error": str(exc)})
-                        ok = False
+                        # A 404 means the video is deleted/private/unavailable and
+                        # can't be added — nothing the user can fix, so skip it
+                        # quietly rather than reporting a failure.
+                        status = getattr(getattr(exc, "resp", None), "status", None)
+                        if status == 404:
+                            unavailable += 1
+                        else:
+                            failures.append({"playlist_id": playlist_id, "video_id": video_id, "error": str(exc)})
+                            ok = False
                 request_page = youtube.playlistItems().list_next(request_page, response)
         except Exception as exc:
-            # Source playlist could not be read (e.g. deleted / not found). Skip it
-            # instead of 500-ing the whole merge, and never delete a source we
-            # couldn't fully read.
-            failures.append({"playlist_id": playlist_id,
-                             "error": "Could not read playlist: " + str(exc)})
+            # Source playlist could not be read. A 404 means it's a ghost / already
+            # gone — nothing the user can fix, so skip it quietly. Other errors are
+            # reported. Never delete a source we couldn't fully read.
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if status == 404:
+                unavailable += 1
+            else:
+                failures.append({"playlist_id": playlist_id,
+                                 "error": "Could not read playlist: " + str(exc)})
             ok = False
         source_fully_merged[playlist_id] = ok
 
@@ -976,6 +988,7 @@ def merge_playlists():
         "failures": failures,
         "added": added,
         "alreadyPresent": already_present,
+        "unavailable": unavailable,
         "skipped": skipped,
         "quotaBlocked": skipped > 0,
     }
