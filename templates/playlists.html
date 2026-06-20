@@ -5,13 +5,20 @@
   <div class="actions">
     <a class="btn secondary" href="{{ url_for('logout') }}">Disconnect</a>
   </div>
-  <div class="meta">
-    Total playlists: <span id="total-playlists">{{ total_playlists }}</span>
-    · Total videos: <span id="total-videos">{{ total_videos }}</span>
-    · Quota units used (today): <span id="api-calls-today">{{ api_calls_used }}</span>
+  <div class="stats-panel">
+    <span class="stat-pill">Playlists: <strong id="total-playlists">{{ total_playlists }}</strong></span>
+    <span class="stat-pill">Videos: <strong id="total-videos">{{ total_videos }}</strong></span>
+    <span class="stat-pill used">Quota units used today: <strong id="api-calls-today">{{ api_calls_used }}</strong> / {{ quota_limit }}</span>
     {% if api_calls_remaining is not none %}
-      · Estimated units remaining: <span id="api-calls-remaining">{{ api_calls_remaining }}</span>
+    <span class="stat-pill">Units remaining: <strong id="api-calls-remaining">{{ api_calls_remaining }}</strong></span>
     {% endif %}
+    <span class="stat-pill saved" title="API calls our optimizations avoided today vs. a naive app">Saved today: <strong id="calls-averted">{{ calls_averted }}</strong> calls / <strong id="units-saved">{{ units_saved }}</strong> units</span>
+  </div>
+  <div class="cost-legend">
+    <span id="savings-breakdown">{% if savings_breakdown %}Saved by — {% for src, v in savings_breakdown.items() %}{{ src }}: {{ v.calls }} call(s) / {{ v.units }} unit(s){% if not loop.last %} · {% endif %}{% endfor %}{% endif %}</span>
+  </div>
+  <div class="cost-legend">
+    Cost guide: a read (list) = <code>{{ read_unit_cost }}</code> unit · a write (add / remove / rename / merge) = <code>{{ write_unit_cost }}</code> units each · daily budget = <code>{{ quota_limit }}</code> units. “Saved” counts calls avoided vs. a naive app — cache hits, client-side sorts, and duplicate inserts skipped.
   </div>
   <div class="sort-controls">
     <div class="actions">
@@ -795,8 +802,26 @@
       });
       rows.forEach((row) => playlistList.appendChild(row));
     }
+    let sortSavingRecorded = false;
+    function recordSortSaving() {
+      /* A naive app would reload the page and refetch every playlist page to
+         re-sort. We sorted in the browser, so log the read calls we avoided —
+         at most once per page load, so repeated Apply clicks don't inflate it. */
+      if (sortSavingRecorded) return;
+      sortSavingRecorded = true;
+      const total = playlistList ? playlistList.querySelectorAll('li').length : 0;
+      const pages = Math.max(1, Math.ceil(total / 50));
+      fetch('/record-savings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+        body: JSON.stringify({ source: 'sort', calls: pages, units: pages }),
+      }).then((r) => r.json()).catch(() => {});
+    }
     if (applySortButton) {
-      applySortButton.addEventListener('click', applyPlaylistSort);
+      applySortButton.addEventListener('click', () => {
+        applyPlaylistSort();
+        recordSortSaving();
+      });
     }
 
     function collectSelectedVideoItems() {
@@ -842,6 +867,22 @@
       if (apiCallsTodayEl) apiCallsTodayEl.textContent = `${count}`;
       if (apiCallsRemainingEl && initialApiQuota !== null) {
         apiCallsRemainingEl.textContent = `${Math.max(initialApiQuota - count, 0)}`;
+      }
+      if (typeof data.quotaUnitsSavedToday !== 'undefined') {
+        const el = document.getElementById('units-saved');
+        if (el) el.textContent = `${data.quotaUnitsSavedToday}`;
+      }
+      if (typeof data.callsAvertedToday !== 'undefined') {
+        const el = document.getElementById('calls-averted');
+        if (el) el.textContent = `${data.callsAvertedToday}`;
+      }
+      if (data.savingsBreakdown) {
+        const el = document.getElementById('savings-breakdown');
+        if (el) {
+          const parts = Object.entries(data.savingsBreakdown)
+            .map(([k, v]) => `${k}: ${v.calls} call(s) / ${v.units} unit(s)`);
+          el.textContent = parts.length ? `Saved by — ${parts.join(' · ')}` : '';
+        }
       }
     }
 

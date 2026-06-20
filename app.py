@@ -56,10 +56,12 @@ mongo_client = MongoClient(MONGODB_CONNECTION_STRING)
 mongo_db = mongo_client.get_default_database()
 api_logs_collection = mongo_db["api_logs"]
 playlist_cache_collection = mongo_db["playlist_cache"]
+savings_log_collection = mongo_db["savings_log"]
 
-# Index the timestamp so the daily quota tally is an index-only scan.
+# Index the timestamp so the daily quota/savings tallies are index-only scans.
 try:
     api_logs_collection.create_index("timestamp")
+    savings_log_collection.create_index("timestamp")
 except Exception:
     pass
 
@@ -68,6 +70,7 @@ today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, mic
 deleted = api_logs_collection.delete_many({"timestamp": {"$lt": today_start}})
 if deleted.deleted_count > 0:
     print(f"[Startup] Deleted {deleted.deleted_count} API log record(s) from previous days.")
+savings_log_collection.delete_many({"timestamp": {"$lt": today_start}})
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_secret_key_change_me")
@@ -84,6 +87,10 @@ def inject_api_stats(response):
             data = response.get_json()
             if isinstance(data, dict):
                 data["quotaUnitsToday"] = get_api_calls_today()
+                saved = get_savings_today()
+                data["quotaUnitsSavedToday"] = saved["units"]
+                data["callsAvertedToday"] = saved["calls"]
+                data["savingsBreakdown"] = saved["by_source"]
                 response.set_data(json.dumps(data))
         except Exception:
             pass
@@ -144,6 +151,50 @@ def get_quota_remaining():
 def remaining_write_budget():
     """How many 50-unit write operations we can still afford today."""
     return get_quota_remaining() // WRITE_UNIT_COST
+
+
+def record_savings(source, calls, units):
+    """Record API calls/units avoided by an optimization (cache, dedup, sort)."""
+    calls = int(calls or 0)
+    units = int(units or 0)
+    if calls <= 0 and units <= 0:
+        return
+    try:
+        savings_log_collection.insert_one({
+            "timestamp": datetime.now(timezone.utc),
+            "source": source,
+            "calls": calls,
+            "units": units,
+        })
+    except Exception:
+        pass
+
+
+def get_savings_today():
+    """Total calls/units avoided today (vs. a naive app), with a per-source breakdown."""
+    today_start_utc = datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    by_source = {}
+    total_calls = 0
+    total_units = 0
+    try:
+        cursor = savings_log_collection.aggregate([
+            {"$match": {"timestamp": {"$gte": today_start_utc}}},
+            {"$group": {"_id": "$source",
+                        "calls": {"$sum": "$calls"},
+                        "units": {"$sum": "$units"}}},
+        ])
+        for doc in cursor:
+            src = doc.get("_id") or "other"
+            c = int(doc.get("calls") or 0)
+            u = int(doc.get("units") or 0)
+            by_source[src] = {"calls": c, "units": u}
+            total_calls += c
+            total_units += u
+    except Exception:
+        pass
+    return {"calls": total_calls, "units": total_units, "by_source": by_source}
 
 
 def get_youtube_client(credentials_dict):
@@ -380,6 +431,10 @@ def index():
         if playlists is None:
             playlists = get_playlists(credentials)
             set_cached_playlists(credentials, playlists)
+        else:
+            # Served from cache — record the playlists.list calls we avoided.
+            pages = max(1, (len(playlists) + 49) // 50)
+            record_savings("cache", pages, pages)
         sort_by = request.args.get("sort", "title")
         sort_order = request.args.get("order", "asc")
         if sort_by not in {"title", "count"}:
@@ -397,6 +452,7 @@ def index():
     api_calls_today = get_api_calls_today()
     quota = get_quota_limit()
     api_calls_remaining = max(quota - api_calls_today, 0)
+    saved = get_savings_today()
     return render_template(
         "playlists.html",
         playlists=playlists,
@@ -406,6 +462,12 @@ def index():
         total_videos=total_videos,
         api_calls_used=api_calls_today,
         api_calls_remaining=api_calls_remaining,
+        quota_limit=quota,
+        units_saved=saved["units"],
+        calls_averted=saved["calls"],
+        savings_breakdown=saved["by_source"],
+        read_unit_cost=DEFAULT_UNIT_COST,
+        write_unit_cost=WRITE_UNIT_COST,
     )
 
 
@@ -672,6 +734,7 @@ def transfer_playlist_items(playlist_id):
     failures = []
     added = 0
     skipped = 0
+    already_present = 0
     delete_after = []
     for item in items:
         if not isinstance(item, dict):
@@ -682,7 +745,8 @@ def transfer_playlist_items(playlist_id):
             failures.append({"videoId": video_id, "error": "Missing videoId"})
             continue
         if video_id in existing_video_ids:
-            # Already in destination; no insert needed. Still remove from source on move.
+            # Already in destination; skip the 50-unit insert. Still remove from source on move.
+            already_present += 1
             if mode == "move" and playlist_item_id:
                 delete_after.append(playlist_item_id)
             continue
@@ -723,12 +787,15 @@ def transfer_playlist_items(playlist_id):
                 budget -= 1
             except Exception as exc:
                 failures.append({"id": item_id, "error": str(exc)})
+    if already_present:
+        record_savings("dedup", already_present, already_present * WRITE_UNIT_COST)
     invalidate_playlist_cache(credentials)
     return {
         "success": len(failures) == 0 and skipped == 0,
         "added": added,
         "removed": len(removed_item_ids),
         "removedItemIds": removed_item_ids,
+        "alreadyPresent": already_present,
         "skipped": skipped,
         "quotaBlocked": skipped > 0,
         "failures": failures,
@@ -758,6 +825,7 @@ def merge_playlists():
     failures = []
     added = 0
     skipped = 0
+    already_present = 0
     source_fully_merged = {}
     for playlist_id in source_ids:
         ok = True
@@ -774,6 +842,7 @@ def merge_playlists():
                 if not video_id:
                     continue
                 if video_id in existing_video_ids:
+                    already_present += 1
                     continue
                 if budget <= 0:
                     skipped += 1
@@ -828,11 +897,14 @@ def merge_playlists():
         except Exception as exc:
             failures.append({"playlist_id": target_id, "error": str(exc)})
 
+    if already_present:
+        record_savings("dedup", already_present, already_present * WRITE_UNIT_COST)
     invalidate_playlist_cache(credentials)
     return {
         "success": len(failures) == 0 and skipped == 0,
         "failures": failures,
         "added": added,
+        "alreadyPresent": already_present,
         "skipped": skipped,
         "quotaBlocked": skipped > 0,
     }
@@ -928,6 +1000,8 @@ def import_videos(playlist_id):
             existing_video_ids.add(video_id)
         except Exception as exc:
             failures.append({"videoId": video_id, "error": str(exc)})
+    if already_present:
+        record_savings("dedup", already_present, already_present * WRITE_UNIT_COST)
     if added:
         invalidate_playlist_cache(credentials)
     return {
@@ -938,6 +1012,27 @@ def import_videos(playlist_id):
         "quotaBlocked": skipped > 0,
         "failures": failures,
     }
+
+
+@app.route("/record-savings", methods=["POST"])
+def record_savings_endpoint():
+    """Record client-side savings (e.g. a client-side sort that avoided a refetch)."""
+    credentials = session.get("credentials") or load_saved_credentials()
+    if not credentials:
+        return {"error": "Not authenticated"}, 401
+    payload = request.get_json(silent=True) or {}
+    if payload.get("source") != "sort":  # only the sort optimization is client-reported
+        return {"error": "Unknown savings source"}, 400
+    try:
+        calls = int(payload.get("calls") or 0)
+        units = int(payload.get("units") or 0)
+    except (TypeError, ValueError, OverflowError):  # OverflowError: JSON Infinity
+        return {"error": "Invalid amounts"}, 400
+    # Clamp so a misbehaving client can't inflate the tally.
+    calls = max(0, min(calls, 10000))
+    units = max(0, min(units, 1000000))
+    record_savings("sort", calls, units)
+    return {"ok": True}
 
 
 @app.route("/login")
