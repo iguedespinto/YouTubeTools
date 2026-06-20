@@ -438,7 +438,13 @@ def index():
         else:
             return render_template("index.html")
     try:
-        playlists = get_cached_playlists(credentials)
+        # A browser refresh (F5 / reload) sends "Cache-Control: max-age=0"
+        # (hard reload: "no-cache"). Treat that as an explicit "show me the
+        # current list" and bypass the cache so a refresh always reflects reality.
+        # Ordinary navigations still reuse the cache to save quota.
+        cache_control = (request.headers.get("Cache-Control") or "").lower()
+        force_refresh = "no-cache" in cache_control or "max-age=0" in cache_control
+        playlists = None if force_refresh else get_cached_playlists(credentials)
         if playlists is None:
             playlists = get_playlists(credentials)
             set_cached_playlists(credentials, playlists)
