@@ -948,7 +948,14 @@ def merge_playlists():
             record_api_call(endpoint="playlists.delete", call_type="delete")
             budget -= 1
         except Exception as exc:
-            failures.append({"playlist_id": playlist_id, "error": str(exc)})
+            # A 404 means the source playlist is already gone — e.g. it was
+            # deleted by a prior merge but still lingered in playlists.list
+            # (YouTube is eventually consistent), or it's a ghost. The videos
+            # were already copied and the source no longer exists, so the merge
+            # goal is met — treat it as success rather than a failure.
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if status != 404:
+                failures.append({"playlist_id": playlist_id, "error": str(exc)})
 
     if new_name and budget > 0:
         try:
