@@ -1,9 +1,10 @@
 import hashlib
 import json
 import os
+import re
 from datetime import datetime, timezone, timedelta
 
-from flask import Flask, redirect, render_template, request, session, url_for
+from flask import Flask, g, redirect, render_template, request, session, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
@@ -79,13 +80,35 @@ playlist_cache_collection = mongo_db["playlist_cache"]
 savings_log_collection = mongo_db["savings_log"]
 # Durable OAuth token store (see TOKEN_DOC_ID). Survives dyno restarts.
 oauth_tokens_collection = mongo_db["oauth_tokens"]
+# API keys for MCP Bearer auth (hashed, never stored in plaintext).
+api_keys_collection = mongo_db["api_keys"]
 
 # Index the timestamp so the daily quota/savings tallies are index-only scans.
 try:
     api_logs_collection.create_index("timestamp")
     savings_log_collection.create_index("timestamp")
+    api_keys_collection.create_index("key_hash", unique=True)
 except Exception:
     pass
+
+# Endpoints that accept Bearer token authentication (for MCP clients).
+# Tuples of (HTTP method, Flask route pattern).
+BEARER_AUTH_ENDPOINTS = frozenset([
+    # Read
+    ("GET", "/api/playlists"),
+    ("GET", "/api/quota"),
+    ("GET", "/playlist/<playlist_id>/items"),
+    # Write
+    ("POST", "/delete/<playlist_id>"),
+    ("POST", "/delete-bulk"),
+    ("POST", "/playlist/<playlist_id>/rename"),
+    ("POST", "/playlist/<playlist_id>/cleanup"),
+    ("POST", "/playlist/<playlist_id>/dedupe"),
+    ("POST", "/playlist/<playlist_id>/import"),
+    ("POST", "/playlist/<playlist_id>/items/delete-bulk"),
+    ("POST", "/playlist/<playlist_id>/items/transfer"),
+    ("POST", "/merge-playlists"),
+])
 
 # On startup, delete logged records from previous days
 today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -99,6 +122,29 @@ app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_secret_key_change_me")
 if IS_PRODUCTION:
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
     app.config["PREFERRED_URL_SCHEME"] = "https"
+
+
+@app.before_request
+def check_bearer_auth():
+    """Authenticate Bearer tokens for allowed API endpoints.
+
+    If the request has a valid Bearer token and hits an allowed endpoint,
+    store the resolved credentials in g.bearer_credentials so route handlers
+    can use them instead of session credentials.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return  # Not a Bearer request; continue to normal session auth
+    # Bearer token present — check if this endpoint accepts it
+    if not is_bearer_auth_allowed(request.method, request.path):
+        return {"error": "Bearer auth not allowed for this endpoint"}, 403
+    credentials = get_bearer_user(request)
+    if not credentials:
+        return {"error": "Invalid or expired API key"}, 401
+    g.bearer_credentials = credentials
+    # Mark API key as used (async-safe, fire-and-forget)
+    if hasattr(g, "api_key_doc") and g.api_key_doc:
+        mark_api_key_used(str(g.api_key_doc["_id"]))
 
 
 @app.after_request
@@ -217,6 +263,109 @@ def get_savings_today():
     except Exception:
         pass
     return {"calls": total_calls, "units": total_units, "by_source": by_source}
+
+
+# ---------------------------------------------------------------------------
+# API Key Management (Bearer auth for MCP clients)
+# ---------------------------------------------------------------------------
+
+def hash_api_key(plaintext):
+    """Return SHA-256 hex digest of the plaintext API key."""
+    return hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
+
+
+def create_api_key(name, key_hash, prefix):
+    """Store a new API key (hashed). Returns the inserted document ID."""
+    doc = {
+        "name": name,
+        "key_hash": key_hash,
+        "prefix": prefix,
+        "created_at": datetime.now(timezone.utc),
+        "last_used_at": None,
+        "revoked": False,
+    }
+    result = api_keys_collection.insert_one(doc)
+    return str(result.inserted_id)
+
+
+def get_api_key_by_hash(key_hash):
+    """Lookup an API key by its hash. Returns the doc or None."""
+    return api_keys_collection.find_one({"key_hash": key_hash, "revoked": False})
+
+
+def mark_api_key_used(key_id):
+    """Update last_used_at timestamp for the given key."""
+    from bson import ObjectId
+    try:
+        api_keys_collection.update_one(
+            {"_id": ObjectId(key_id)},
+            {"$set": {"last_used_at": datetime.now(timezone.utc)}},
+        )
+    except Exception:
+        pass
+
+
+def revoke_api_key(key_id):
+    """Mark an API key as revoked."""
+    from bson import ObjectId
+    api_keys_collection.update_one(
+        {"_id": ObjectId(key_id)},
+        {"$set": {"revoked": True, "revoked_at": datetime.now(timezone.utc)}},
+    )
+
+
+def list_api_keys():
+    """Return all API keys (metadata only, never the hash)."""
+    keys = []
+    for doc in api_keys_collection.find({"revoked": False}):
+        keys.append({
+            "id": str(doc["_id"]),
+            "name": doc.get("name"),
+            "prefix": doc.get("prefix"),
+            "created_at": doc.get("created_at"),
+            "last_used_at": doc.get("last_used_at"),
+        })
+    return keys
+
+
+def is_bearer_auth_allowed(method, path):
+    """Check if the given method+path accepts Bearer token auth."""
+    # Check exact matches first
+    if (method, path) in BEARER_AUTH_ENDPOINTS:
+        return True
+    # Check pattern matches (convert path params like /playlist/ABC/items to /playlist/<playlist_id>/items)
+    for allowed_method, allowed_pattern in BEARER_AUTH_ENDPOINTS:
+        if method != allowed_method:
+            continue
+        # Convert pattern to regex: <param> → [^/]+
+        regex_pattern = re.sub(r"<[^>]+>", r"[^/]+", allowed_pattern)
+        if re.fullmatch(regex_pattern, path):
+            return True
+    return False
+
+
+def get_bearer_user(req):
+    """Extract and validate Bearer token from Authorization header.
+
+    Returns the credentials dict if valid, None otherwise.
+    Sets g.api_key_doc if auth succeeds (for marking usage).
+    """
+    auth_header = req.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    token = auth_header[7:].strip()
+    if not token:
+        return None
+    key_hash = hash_api_key(token)
+    key_doc = get_api_key_by_hash(key_hash)
+    if not key_doc:
+        return None
+    # Bearer auth uses the single stored OAuth token (single-account mode).
+    credentials = load_saved_credentials()
+    if not credentials:
+        return None
+    g.api_key_doc = key_doc
+    return credentials
 
 
 def get_youtube_client(credentials_dict):
@@ -502,6 +651,81 @@ def sort_playlists(playlists, sort_by, sort_order):
     return sorted(playlists, key=key_func, reverse=reverse)
 
 
+def get_credentials_from_request():
+    """Return credentials from Bearer auth (g.bearer_credentials) or session."""
+    if hasattr(g, "bearer_credentials") and g.bearer_credentials:
+        return g.bearer_credentials
+    return session.get("credentials") or load_saved_credentials()
+
+
+def is_api_request():
+    """Check if the request expects a JSON response (API/MCP client)."""
+    if hasattr(g, "bearer_credentials") and g.bearer_credentials:
+        return True
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return True
+    accept = request.headers.get("Accept", "")
+    if "application/json" in accept:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# API Endpoints (JSON-only, for MCP clients)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/playlists")
+def api_playlists():
+    """Return playlist list as JSON for MCP clients."""
+    credentials = get_credentials_from_request()
+    if not credentials:
+        return {"error": "Not authenticated"}, 401
+    try:
+        playlists = get_cached_playlists(credentials)
+        if playlists is None:
+            playlists = get_playlists(credentials)
+            set_cached_playlists(credentials, playlists)
+        else:
+            pages = max(1, (len(playlists) + 49) // 50)
+            record_savings("cache", pages, pages)
+        if IGNORED_PLAYLIST_IDS:
+            playlists = [p for p in playlists if p.get("id") not in IGNORED_PLAYLIST_IDS]
+        # Simplify for MCP: return id, title, itemCount
+        simplified = []
+        for p in playlists:
+            simplified.append({
+                "id": p.get("id"),
+                "title": (p.get("snippet") or {}).get("title"),
+                "description": (p.get("snippet") or {}).get("description"),
+                "itemCount": (p.get("contentDetails") or {}).get("itemCount", 0),
+                "thumbnailUrl": (((p.get("snippet") or {}).get("thumbnails") or {}).get("default") or {}).get("url"),
+            })
+        return {"playlists": simplified}
+    except Exception as exc:
+        return {"error": str(exc)}, 500
+
+
+@app.route("/api/quota")
+def api_quota():
+    """Return quota status as JSON for MCP clients."""
+    credentials = get_credentials_from_request()
+    if not credentials:
+        return {"error": "Not authenticated"}, 401
+    quota_limit = get_quota_limit()
+    units_used = get_api_calls_today()
+    units_remaining = max(quota_limit - units_used, 0)
+    saved = get_savings_today()
+    return {
+        "quotaLimit": quota_limit,
+        "unitsUsed": units_used,
+        "unitsRemaining": units_remaining,
+        "writeOperationsRemaining": units_remaining // WRITE_UNIT_COST,
+        "unitsSavedToday": saved["units"],
+        "callsAvertedToday": saved["calls"],
+        "savingsBreakdown": saved["by_source"],
+    }
+
+
 @app.route("/")
 def index():
     credentials = session.get("credentials")
@@ -567,8 +791,10 @@ def index():
 
 @app.route("/delete/<playlist_id>", methods=["POST"])
 def delete_playlist(playlist_id):
-    credentials = session.get("credentials") or load_saved_credentials()
+    credentials = get_credentials_from_request()
     if not credentials:
+        if is_api_request():
+            return {"error": "Not authenticated"}, 401
         return redirect(url_for("index"))
     youtube, _ = get_youtube_client(credentials)
     try:
@@ -576,10 +802,10 @@ def delete_playlist(playlist_id):
         record_api_call(endpoint="playlists.delete", call_type="delete")
         invalidate_playlist_cache(credentials)
     except Exception as exc:
-        if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        if is_api_request():
             return {"error": str(exc)}, 400
         return render_template("error.html", error_message=str(exc))
-    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+    if is_api_request():
         return {"success": True}
     sort_by = request.args.get("sort", "title")
     sort_order = request.args.get("order", "asc")
@@ -588,7 +814,7 @@ def delete_playlist(playlist_id):
 
 @app.route("/delete-bulk", methods=["POST"])
 def delete_bulk():
-    credentials = session.get("credentials") or load_saved_credentials()
+    credentials = get_credentials_from_request()
     if not credentials:
         return {"error": "Not authenticated"}, 401
     payload = request.get_json(silent=True) or {}
@@ -620,7 +846,7 @@ def delete_bulk():
 
 @app.route("/playlist/<playlist_id>/items")
 def playlist_items(playlist_id):
-    credentials = session.get("credentials") or load_saved_credentials()
+    credentials = get_credentials_from_request()
     if not credentials:
         return {"error": "Not authenticated"}, 401
     youtube, _ = get_youtube_client(credentials)
@@ -672,7 +898,7 @@ def playlist_items(playlist_id):
 @app.route("/playlist/<playlist_id>/cleanup", methods=["POST"])
 def cleanup_playlist(playlist_id):
     """Explicitly remove deleted/private videos. Each removal costs 50 units."""
-    credentials = session.get("credentials") or load_saved_credentials()
+    credentials = get_credentials_from_request()
     if not credentials:
         return {"error": "Not authenticated"}, 401
     payload = request.get_json(silent=True) or {}
@@ -736,7 +962,7 @@ def cleanup_playlist(playlist_id):
 
 @app.route("/playlist/<playlist_id>/dedupe", methods=["POST"])
 def dedupe_playlist(playlist_id):
-    credentials = session.get("credentials") or load_saved_credentials()
+    credentials = get_credentials_from_request()
     if not credentials:
         return {"error": "Not authenticated"}, 401
     youtube, _ = get_youtube_client(credentials)
@@ -802,7 +1028,7 @@ def dedupe_playlist(playlist_id):
 
 @app.route("/playlist/<playlist_id>/items/delete-bulk", methods=["POST"])
 def delete_playlist_items_bulk(playlist_id):
-    credentials = session.get("credentials") or load_saved_credentials()
+    credentials = get_credentials_from_request()
     if not credentials:
         return {"error": "Not authenticated"}, 401
     payload = request.get_json(silent=True) or {}
@@ -834,7 +1060,7 @@ def delete_playlist_items_bulk(playlist_id):
 
 @app.route("/playlist/<playlist_id>/items/transfer", methods=["POST"])
 def transfer_playlist_items(playlist_id):
-    credentials = session.get("credentials") or load_saved_credentials()
+    credentials = get_credentials_from_request()
     if not credentials:
         return {"error": "Not authenticated"}, 401
     payload = request.get_json(silent=True) or {}
@@ -933,7 +1159,7 @@ def transfer_playlist_items(playlist_id):
 
 @app.route("/merge-playlists", methods=["POST"])
 def merge_playlists():
-    credentials = session.get("credentials") or load_saved_credentials()
+    credentials = get_credentials_from_request()
     if not credentials:
         return {"error": "Not authenticated"}, 401
     payload = request.get_json(silent=True) or {}
@@ -1077,7 +1303,7 @@ def merge_playlists():
 
 @app.route("/playlist/<playlist_id>/rename", methods=["POST"])
 def rename_playlist(playlist_id):
-    credentials = session.get("credentials") or load_saved_credentials()
+    credentials = get_credentials_from_request()
     if not credentials:
         return {"error": "Not authenticated"}, 401
     payload = request.get_json(silent=True) or {}
@@ -1122,7 +1348,7 @@ def rename_playlist(playlist_id):
 
 @app.route("/playlist/<playlist_id>/import", methods=["POST"])
 def import_videos(playlist_id):
-    credentials = session.get("credentials") or load_saved_credentials()
+    credentials = get_credentials_from_request()
     if not credentials:
         return {"error": "Not authenticated"}, 401
     payload = request.get_json(silent=True) or {}
@@ -1190,7 +1416,7 @@ def import_videos(playlist_id):
 @app.route("/record-savings", methods=["POST"])
 def record_savings_endpoint():
     """Record client-side savings (e.g. a client-side sort that avoided a refetch)."""
-    credentials = session.get("credentials") or load_saved_credentials()
+    credentials = get_credentials_from_request()
     if not credentials:
         return {"error": "Not authenticated"}, 401
     payload = request.get_json(silent=True) or {}
