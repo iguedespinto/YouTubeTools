@@ -30,5 +30,12 @@ Then open `http://127.0.0.1:3000` and connect your YouTube account.
 
 - You can set a custom path for the client secrets file using `YT_CLIENT_SECRETS`.
 - `CLIENT_ID` / `CLIENT_SECRET` are also supported (compatible with NightGuardian).
-- Tokens are stored in `token.json` by default. Set `YT_TOKEN_FILE` to override.
+- **Tokens are stored durably in MongoDB** (collection `oauth_tokens`, one document per
+  `YT_TOKEN_DOC_ID`, default `"default"`). This survives Heroku dyno restarts, where the
+  filesystem is ephemeral. A local `token.json` is still written/read as a dev fallback
+  and for one-time migration; override its path with `YT_TOKEN_FILE`.
+- The access token is refreshed automatically (proactively, just before expiry), so once
+  you connect an account the integration runs unattended. **For truly unattended use the
+  Google OAuth consent screen must be "Published / In production"** — in "Testing" status
+  Google expires refresh tokens after 7 days regardless of where they're stored.
 # YouTubeTools

@@ -7,6 +7,7 @@ from flask import Flask, redirect, render_template, request, session, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
+from google.auth.exceptions import RefreshError
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from pymongo import MongoClient
@@ -35,6 +36,14 @@ TOKEN_FILE = (
     or os.getenv("TOKEN_FILE")
     or "token.json"
 )
+# Single-account OAuth token store. The credentials live under this _id in
+# MongoDB so they survive Heroku dyno restarts (the dyno filesystem is
+# ephemeral and silently loses a token file on every restart/deploy).
+# Re-authenticating just overwrites this one document.
+TOKEN_DOC_ID = os.getenv("YT_TOKEN_DOC_ID", "default")
+# Refresh the access token this many seconds before it actually expires, so a
+# long-running, system-to-system call never fires with a token about to lapse.
+TOKEN_REFRESH_BUFFER = timedelta(seconds=120)
 API_CALL_QUOTA = os.getenv("YT_API_CALLS_QUOTA")
 # YouTube Data API v3 default daily quota, measured in *units* (not calls).
 # Used as the budget when YT_API_CALLS_QUOTA is not set.
@@ -68,6 +77,8 @@ mongo_db = mongo_client.get_default_database()
 api_logs_collection = mongo_db["api_logs"]
 playlist_cache_collection = mongo_db["playlist_cache"]
 savings_log_collection = mongo_db["savings_log"]
+# Durable OAuth token store (see TOKEN_DOC_ID). Survives dyno restarts.
+oauth_tokens_collection = mongo_db["oauth_tokens"]
 
 # Index the timestamp so the daily quota/savings tallies are index-only scans.
 try:
@@ -218,10 +229,30 @@ def get_youtube_client(credentials_dict):
     """
     normalized = normalize_saved_credentials(credentials_dict) or credentials_dict
     creds = Credentials(**normalized)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+    if _needs_refresh(creds) and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except RefreshError:
+            # The refresh token is dead — revoked, or expired because the OAuth
+            # consent screen is still in "Testing" (those expire after 7 days).
+            # Drop the stored token so the UI prompts a fresh Connect.
+            clear_saved_credentials()
+            raise
         save_credentials(creds)
     return build("youtube", "v3", credentials=creds, static_discovery=True), creds
+
+
+def _needs_refresh(creds):
+    """True if the token is missing/expired or within the pre-expiry buffer."""
+    if not creds.token:
+        return False
+    if creds.expired:
+        return True
+    if creds.expiry is None:
+        return False
+    # creds.expiry is a naive UTC datetime; compare against naive UTC now.
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    return creds.expiry <= now_utc + TOKEN_REFRESH_BUFFER
 
 
 def get_flow(state=None):
@@ -304,36 +335,80 @@ def normalize_saved_credentials(data):
     return None
 
 
-def load_saved_credentials():
+def _load_credentials_from_mongo():
+    try:
+        doc = oauth_tokens_collection.find_one({"_id": TOKEN_DOC_ID})
+    except Exception:
+        return None
+    if not doc:
+        return None
+    doc.pop("_id", None)
+    doc.pop("updated_at", None)
+    return doc
+
+
+def _load_credentials_from_file():
     if not os.path.exists(TOKEN_FILE):
         return None
     try:
         with open(TOKEN_FILE, "r", encoding="utf-8") as token_file:
-            data = json.load(token_file)
-        return normalize_saved_credentials(data)
+            return json.load(token_file)
     except (OSError, json.JSONDecodeError):
         return None
 
 
-def save_credentials(credentials):
+def load_saved_credentials():
+    # Mongo is the durable store (survives Heroku dyno restarts). Fall back to a
+    # local token file for development and for one-time migration of an existing
+    # file-based token: the next save_credentials() writes it through to Mongo.
+    data = _load_credentials_from_mongo() or _load_credentials_from_file()
+    return normalize_saved_credentials(data) if data else None
+
+
+def _save_credentials_to_mongo(data):
+    try:
+        doc = dict(data)
+        doc["_id"] = TOKEN_DOC_ID
+        doc["updated_at"] = datetime.now(timezone.utc)
+        oauth_tokens_collection.replace_one({"_id": TOKEN_DOC_ID}, doc, upsert=True)
+    except Exception:
+        pass
+
+
+def _save_credentials_to_file(data):
     try:
         token_dir = os.path.dirname(TOKEN_FILE)
         if token_dir:
             os.makedirs(token_dir, exist_ok=True)
-        existing = load_saved_credentials() or {}
-        data = credentials_to_dict(credentials)
-        if not data.get("refresh_token") and existing.get("refresh_token"):
-            data["refresh_token"] = existing.get("refresh_token")
-        if not data.get("token_uri") and existing.get("token_uri"):
-            data["token_uri"] = existing.get("token_uri")
-        if not data.get("client_id") and existing.get("client_id"):
-            data["client_id"] = existing.get("client_id")
-        if not data.get("client_secret") and existing.get("client_secret"):
-            data["client_secret"] = existing.get("client_secret")
         with open(TOKEN_FILE, "w", encoding="utf-8") as token_file:
             json.dump(data, token_file)
     except OSError:
         return
+
+
+def save_credentials(credentials):
+    existing = load_saved_credentials() or {}
+    data = credentials_to_dict(credentials)
+    # A refresh response usually omits these; carry the saved values forward so
+    # the long-lived refresh token (and client config) is never lost on refresh.
+    for field in ("refresh_token", "token_uri", "client_id", "client_secret"):
+        if not data.get(field) and existing.get(field):
+            data[field] = existing.get(field)
+    _save_credentials_to_mongo(data)
+    _save_credentials_to_file(data)
+
+
+def clear_saved_credentials():
+    """Remove the stored token everywhere (used on logout or a dead refresh token)."""
+    try:
+        oauth_tokens_collection.delete_one({"_id": TOKEN_DOC_ID})
+    except Exception:
+        pass
+    if os.path.exists(TOKEN_FILE):
+        try:
+            os.remove(TOKEN_FILE)
+        except OSError:
+            pass
 
 
 def cache_key_for(credentials_dict):
@@ -1168,11 +1243,7 @@ def oauth2callback():
 @app.route("/logout")
 def logout():
     session.clear()
-    if os.path.exists(TOKEN_FILE):
-        try:
-            os.remove(TOKEN_FILE)
-        except OSError:
-            pass
+    clear_saved_credentials()
     return redirect(url_for("index"))
 
 
