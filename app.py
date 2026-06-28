@@ -119,6 +119,9 @@ savings_log_collection.delete_many({"timestamp": {"$lt": today_start}})
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "dev_secret_key_change_me")
+# Keep the owner's browser login durable so requiring a session (instead of the
+# old anonymous auto-login) doesn't force a re-login on every browser restart.
+app.permanent_session_lifetime = timedelta(days=30)
 if IS_PRODUCTION:
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
     app.config["PREFERRED_URL_SCHEME"] = "https"
@@ -652,10 +655,16 @@ def sort_playlists(playlists, sort_by, sort_order):
 
 
 def get_credentials_from_request():
-    """Return credentials from Bearer auth (g.bearer_credentials) or session."""
+    """Return credentials from Bearer auth (g.bearer_credentials) or session.
+
+    Does NOT fall back to the stored token for unauthenticated callers: doing so
+    would let anyone who knows the public URL act on the owner's account. The
+    stored token is reachable only via a valid Bearer key (see get_bearer_user)
+    or an authenticated browser session established through the OAuth login flow.
+    """
     if hasattr(g, "bearer_credentials") and g.bearer_credentials:
         return g.bearer_credentials
-    return session.get("credentials") or load_saved_credentials()
+    return session.get("credentials")
 
 
 def is_api_request():
@@ -728,14 +737,12 @@ def api_quota():
 
 @app.route("/")
 def index():
+    # The browser is authorized only by an OAuth-established session. We do NOT
+    # auto-log-in from the stored token here: that would seed any anonymous
+    # visitor's session with the owner's credentials (and thus write access).
     credentials = session.get("credentials")
     if not credentials:
-        saved_credentials = load_saved_credentials()
-        if saved_credentials:
-            session["credentials"] = saved_credentials
-            credentials = saved_credentials
-        else:
-            return render_template("index.html")
+        return render_template("index.html")
     try:
         # A browser refresh (F5 / reload) sends "Cache-Control: max-age=0"
         # (hard reload: "no-cache"). Treat that as an explicit "show me the
@@ -1461,6 +1468,7 @@ def oauth2callback():
         authorization_response = authorization_response.replace("http://", "https://", 1)
     flow.fetch_token(authorization_response=authorization_response)
     credentials = flow.credentials
+    session.permanent = True  # honor permanent_session_lifetime (30 days)
     session["credentials"] = credentials_to_dict(credentials)
     save_credentials(credentials)
     return redirect(url_for("index"))
