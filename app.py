@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import random
 import re
 from datetime import datetime, timezone, timedelta
 
@@ -97,6 +98,7 @@ BEARER_AUTH_ENDPOINTS = frozenset([
     # Read
     ("GET", "/api/playlists"),
     ("GET", "/api/quota"),
+    ("GET", "/api/random-videos"),
     ("GET", "/playlist/<playlist_id>/items"),
     # Write
     ("POST", "/delete/<playlist_id>"),
@@ -629,6 +631,70 @@ def fetch_playlist_video_ids(youtube, playlist_id):
     return video_ids
 
 
+def best_thumbnail_url(snippet):
+    """Pick the best available thumbnail URL from a snippet's thumbnails."""
+    thumbs = (snippet or {}).get("thumbnails") or {}
+    for size in ("maxres", "standard", "high", "medium", "default"):
+        url = (thumbs.get(size) or {}).get("url")
+        if url:
+            return url
+    return None
+
+
+def fetch_all_playlist_videos(youtube, playlist_id):
+    """Return every (live) video in a playlist, paginating through ALL pages.
+
+    Skips deleted/private videos. Costs 1 quota unit per 50 items.
+    Returns a list of dicts: {videoId, title, thumbnailUrl}.
+    """
+    videos = []
+    request_page = youtube.playlistItems().list(
+        part="snippet,contentDetails",
+        playlistId=playlist_id,
+        maxResults=50,
+    )
+    while request_page is not None:
+        response = request_page.execute()
+        record_api_call(endpoint="playlistItems.list", call_type="list")
+        for item in response.get("items", []):
+            snippet = item.get("snippet") or {}
+            details = item.get("contentDetails") or {}
+            title = snippet.get("title") or ""
+            video_id = details.get("videoId")
+            if not video_id or title in ("Deleted video", "Private video"):
+                continue
+            videos.append({
+                "videoId": video_id,
+                "title": title,
+                "thumbnailUrl": best_thumbnail_url(snippet),
+            })
+        request_page = youtube.playlistItems().list_next(request_page, response)
+    return videos
+
+
+def find_playlist_id_by_name(credentials_dict, name):
+    """Resolve a playlist title to its id (case-insensitive, first match).
+
+    Returns (playlist_id, available_titles). playlist_id is None if not found,
+    in which case available_titles lists the user's playlist names for the error.
+    Reuses the cached playlist list to avoid an extra quota hit when possible.
+    """
+    playlists = get_cached_playlists(credentials_dict)
+    if playlists is None:
+        playlists = get_playlists(credentials_dict)
+        set_cached_playlists(credentials_dict, playlists)
+    target = (name or "").strip().casefold()
+    titles = []
+    for p in playlists:
+        if p.get("id") in IGNORED_PLAYLIST_IDS:
+            continue
+        title = (p.get("snippet") or {}).get("title") or ""
+        titles.append(title)
+        if title.strip().casefold() == target:
+            return p.get("id"), titles
+    return None, titles
+
+
 def get_playlists(credentials_dict):
     youtube, _ = get_youtube_client(credentials_dict)
     playlists = []
@@ -732,6 +798,60 @@ def api_quota():
         "unitsSavedToday": saved["units"],
         "callsAvertedToday": saved["calls"],
         "savingsBreakdown": saved["by_source"],
+    }
+
+
+@app.route("/api/random-videos")
+def api_random_videos():
+    """Return N random videos from a named playlist, sampled across ALL its videos.
+
+    Query params:
+        playlist: the playlist's title (case-insensitive).
+        count:    how many random videos to return (default 5).
+
+    The whole playlist is paginated first, then a uniform random sample is taken,
+    so the result is drawn from every video, not just the first page.
+    """
+    credentials = get_credentials_from_request()
+    if not credentials:
+        return {"error": "Not authenticated"}, 401
+    name = (request.args.get("playlist") or "").strip()
+    if not name:
+        return {"error": "Missing 'playlist' (playlist name)"}, 400
+    try:
+        count = int(request.args.get("count", "5"))
+    except (TypeError, ValueError):
+        return {"error": "'count' must be an integer"}, 400
+    if count <= 0:
+        return {"error": "'count' must be a positive integer"}, 400
+
+    playlist_id, available = find_playlist_id_by_name(credentials, name)
+    if not playlist_id:
+        return {"error": f"No playlist named '{name}'", "availablePlaylists": available}, 404
+
+    try:
+        youtube, _ = get_youtube_client(credentials)
+        all_videos = fetch_all_playlist_videos(youtube, playlist_id)
+    except Exception as exc:
+        return {"error": str(exc)}, 500
+
+    k = min(count, len(all_videos))
+    chosen = random.sample(all_videos, k) if k else []
+    videos = [
+        {
+            "title": v["title"],
+            "url": f"https://www.youtube.com/watch?v={v['videoId']}",
+            "thumbnailUrl": v["thumbnailUrl"],
+        }
+        for v in chosen
+    ]
+    return {
+        "playlist": name,
+        "playlistId": playlist_id,
+        "requested": count,
+        "totalAvailable": len(all_videos),
+        "returned": len(videos),
+        "videos": videos,
     }
 
 

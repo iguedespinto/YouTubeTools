@@ -81,6 +81,7 @@ Add to your `claude_desktop_config.json`:
 |------|-------------|
 | `list_playlists` | List all user playlists with metadata |
 | `get_playlist_items` | Fetch videos in a playlist (paginated) |
+| `random_videos` | Return N random videos from a playlist (by name), sampled across ALL its videos |
 | `get_quota_status` | Check remaining API budget and savings stats |
 
 ### Write Operations (50 quota units each)

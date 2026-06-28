@@ -89,6 +89,29 @@ def get_playlist_items(playlist_id: str, page_token: str | None = None) -> dict[
 
 
 @mcp.tool()
+def random_videos(playlist_name: str, count: int = 5) -> dict[str, Any]:
+    """Return a random selection of videos from a playlist.
+
+    The sample is drawn from ALL videos in the playlist (the server paginates
+    through every page first), not just the first 50/100.
+
+    Args:
+        playlist_name: The playlist's title, as shown on YouTube (case-insensitive).
+        count: How many random videos to return (default 5). If the playlist has
+               fewer videos than requested, all of them are returned.
+
+    Returns videos with title, url, and thumbnailUrl, plus totalAvailable
+    (live videos in the playlist) and returned (how many were sampled).
+    Quota cost: 1 unit per 50 videos in the playlist (full scan to sample fairly).
+    """
+    return _request(
+        "GET",
+        "/api/random-videos",
+        params={"playlist": playlist_name, "count": count},
+    )
+
+
+@mcp.tool()
 def get_quota_status() -> dict[str, Any]:
     """Check remaining API budget and savings stats.
 
