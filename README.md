@@ -38,4 +38,8 @@ Then open `http://127.0.0.1:3000` and connect your YouTube account.
   you connect an account the integration runs unattended. **For truly unattended use the
   Google OAuth consent screen must be "Published / In production"** — in "Testing" status
   Google expires refresh tokens after 7 days regardless of where they're stored.
+- **Auth model:** the stored token is never served anonymously. The web UI requires an
+  OAuth-established session (sign in via "Connect"); the JSON `/api/*` and all write
+  endpoints require a valid `Authorization: Bearer <key>` (mint keys with
+  `scripts/mint_api_key.py`) — used by the MCP server. Requests with neither get `401`.
 # YouTubeTools
