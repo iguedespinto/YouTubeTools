@@ -14,6 +14,15 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from pymongo import MongoClient
 
+from yt_lib import (
+    extract_channel_ref,
+    filter_candidates,
+    parse_iso8601_duration,
+    parse_rfc3339,
+    published_after_from,
+    OPAQUE_ID_RE,
+)
+
 SCOPES = ["https://www.googleapis.com/auth/youtube"]
 try:
     from dotenv import load_dotenv
@@ -83,6 +92,9 @@ savings_log_collection = mongo_db["savings_log"]
 oauth_tokens_collection = mongo_db["oauth_tokens"]
 # API keys for MCP Bearer auth (hashed, never stored in plaintext).
 api_keys_collection = mongo_db["api_keys"]
+# Channel @handle/URL -> uploads playlist resolution cache. These mappings are
+# immutable, so caching them makes repeat channel scans cost zero quota.
+channel_cache_collection = mongo_db["channel_cache"]
 
 # Index the timestamp so the daily quota/savings tallies are index-only scans.
 try:
@@ -99,8 +111,11 @@ BEARER_AUTH_ENDPOINTS = frozenset([
     ("GET", "/api/playlists"),
     ("GET", "/api/quota"),
     ("GET", "/api/random-videos"),
+    ("GET", "/api/channel/videos"),
     ("GET", "/playlist/<playlist_id>/items"),
     # Write
+    ("POST", "/api/add-from-channels"),
+    ("POST", "/api/playlist-membership"),
     ("POST", "/delete/<playlist_id>"),
     ("POST", "/delete-bulk"),
     ("POST", "/playlist/<playlist_id>/rename"),
@@ -711,6 +726,190 @@ def get_playlists(credentials_dict):
     return playlists
 
 
+# ---------------------------------------------------------------------------
+# Channel resolution + video metadata (for scanning channel uploads)
+# ---------------------------------------------------------------------------
+
+
+def _get_cached_channel(cache_id):
+    try:
+        doc = channel_cache_collection.find_one({"_id": cache_id})
+    except Exception:
+        return None
+    if not doc:
+        return None
+    return {k: doc.get(k) for k in ("channelId", "channelTitle", "uploadsPlaylistId")}
+
+
+def _set_cached_channel(cache_id, resolved):
+    try:
+        channel_cache_collection.replace_one(
+            {"_id": cache_id}, {"_id": cache_id, **resolved}, upsert=True
+        )
+    except Exception:
+        pass
+
+
+def resolve_channel(youtube, channel):
+    """Resolve a channel @handle / URL / ID to its uploads playlist.
+
+    Returns {"channelId", "channelTitle", "uploadsPlaylistId"}. The mapping is
+    cached in Mongo (it never changes), so repeat scans cost no quota. Costs 1
+    unit on a cache miss. Raises ValueError if the channel can't be found.
+    """
+    ref = extract_channel_ref(channel)
+    if not ref:
+        raise ValueError(f"Empty or unrecognized channel reference: {channel!r}")
+    kind, value = ref
+    cache_id = f"{kind}:{value.casefold()}"
+    cached = _get_cached_channel(cache_id)
+    if cached and cached.get("uploadsPlaylistId"):
+        record_savings("channel_cache", 1, 1)
+        return cached
+
+    params = {"part": "snippet,contentDetails"}
+    if kind == "id":
+        params["id"] = value
+    elif kind == "username":
+        params["forUsername"] = value
+    else:
+        params["forHandle"] = value
+    response = youtube.channels().list(**params).execute()
+    record_api_call(endpoint="channels.list", call_type="list")
+    items = response.get("items") or []
+    if not items:
+        raise ValueError(f"Channel not found: {channel}")
+    item = items[0]
+    resolved = {
+        "channelId": item.get("id"),
+        "channelTitle": (item.get("snippet") or {}).get("title"),
+        "uploadsPlaylistId": (
+            ((item.get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads")
+        ),
+    }
+    if not resolved["uploadsPlaylistId"]:
+        raise ValueError(f"Channel has no uploads playlist: {channel}")
+    _set_cached_channel(cache_id, resolved)
+    return resolved
+
+
+def fetch_channel_recent_videos(youtube, uploads_playlist_id, published_after, max_results=50):
+    """Return uploads published at/after `published_after` (a tz-aware datetime).
+
+    The uploads playlist is reverse-chronological, so paging stops as soon as an
+    item older than the cutoff is seen — a short window is usually a single page.
+    Returns list of {videoId, title, publishedAt}. Costs 1 unit per page read.
+    """
+    videos = []
+    request_page = youtube.playlistItems().list(
+        part="contentDetails,snippet",
+        playlistId=uploads_playlist_id,
+        maxResults=50,
+    )
+    while request_page is not None:
+        response = request_page.execute()
+        record_api_call(endpoint="playlistItems.list", call_type="list")
+        stop = False
+        for item in response.get("items", []):
+            details = item.get("contentDetails") or {}
+            video_id = details.get("videoId")
+            published_dt = parse_rfc3339(details.get("videoPublishedAt"))
+            if not video_id or published_dt is None:
+                continue
+            if published_dt < published_after:
+                stop = True
+                break
+            videos.append({
+                "videoId": video_id,
+                "title": (item.get("snippet") or {}).get("title") or "",
+                "publishedAt": details.get("videoPublishedAt"),
+            })
+            if len(videos) >= max_results:
+                stop = True
+                break
+        if stop:
+            break
+        request_page = youtube.playlistItems().list_next(request_page, response)
+    return videos
+
+
+def fetch_video_details(youtube, video_ids):
+    """Batch-fetch metadata for video IDs (1 unit per 50 IDs).
+
+    Returns {videoId: {durationSeconds, publishedAt, title, channelTitle}}.
+    """
+    details = {}
+    ids = [v for v in dict.fromkeys(video_ids) if v]  # de-dupe, keep order
+    for i in range(0, len(ids), 50):
+        chunk = ids[i:i + 50]
+        response = youtube.videos().list(
+            part="contentDetails,snippet",
+            id=",".join(chunk),
+        ).execute()
+        record_api_call(endpoint="videos.list", call_type="list")
+        for item in response.get("items", []):
+            snippet = item.get("snippet") or {}
+            content = item.get("contentDetails") or {}
+            details[item.get("id")] = {
+                "durationSeconds": parse_iso8601_duration(content.get("duration")),
+                "publishedAt": snippet.get("publishedAt"),
+                "title": snippet.get("title") or "",
+                "channelTitle": snippet.get("channelTitle") or "",
+            }
+    return details
+
+
+def resolve_playlist_ref(credentials_dict, ref):
+    """Resolve a playlist name OR id to a playlist id.
+
+    Returns (playlist_id, available_titles). A value matching a playlist the
+    user owns (by id) is used directly; otherwise it's looked up as a title.
+    As a last resort an opaque-id-looking value is returned as-is so external
+    playlist ids still work. playlist_id is None if nothing matched.
+    """
+    ref = (ref or "").strip()
+    if not ref:
+        return None, []
+    playlists = get_cached_playlists(credentials_dict)
+    if playlists is None:
+        playlists = get_playlists(credentials_dict)
+        set_cached_playlists(credentials_dict, playlists)
+    ids = {p.get("id") for p in playlists}
+    titles = [(p.get("snippet") or {}).get("title") or "" for p in playlists]
+    if ref in ids:
+        return ref, titles
+    pid, titles = find_playlist_id_by_name(credentials_dict, ref)
+    if pid:
+        return pid, titles
+    if OPAQUE_ID_RE.match(ref):
+        return ref, titles
+    return None, titles
+
+
+def _resolve_time_window(source):
+    """Resolve a recency window from request args or a JSON body (dict-like).
+
+    Accepts `published_after` (ISO8601) or `since_hours` (number, default 24).
+    Returns (since_hours, published_after_dt, error_message).
+    """
+    published_after_raw = (source.get("published_after") or "").strip() \
+        if source.get("published_after") else ""
+    if published_after_raw:
+        dt = parse_rfc3339(published_after_raw)
+        if dt is None:
+            return None, None, "'published_after' must be an ISO8601 timestamp"
+        hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+        return round(hours, 2), dt, None
+    try:
+        since_hours = float(source.get("since_hours", 24))
+    except (TypeError, ValueError):
+        return None, None, "'since_hours' must be a number"
+    if since_hours <= 0:
+        return None, None, "'since_hours' must be positive"
+    dt = published_after_from(datetime.now(timezone.utc), since_hours)
+    return since_hours, dt, None
+
+
 def sort_playlists(playlists, sort_by, sort_order):
     reverse = sort_order == "desc"
     if sort_by == "count":
@@ -852,6 +1051,244 @@ def api_random_videos():
         "totalAvailable": len(all_videos),
         "returned": len(videos),
         "videos": videos,
+    }
+
+
+@app.route("/api/channel/videos")
+def api_channel_videos():
+    """Return recent uploads for a channel (@handle / URL / ID) as JSON.
+
+    Query params:
+        channel:              @handle, channel URL, or UC... id (required).
+        since_hours:          recency window in hours (default 24).
+        published_after:      ISO8601 cutoff (overrides since_hours).
+        min_duration_seconds: drop videos shorter than this (default 0).
+        max_results:          cap on videos returned (default 50).
+    """
+    credentials = get_credentials_from_request()
+    if not credentials:
+        return {"error": "Not authenticated"}, 401
+    channel = (request.args.get("channel") or "").strip()
+    if not channel:
+        return {"error": "Missing 'channel'"}, 400
+    since_hours, published_after, err = _resolve_time_window(request.args)
+    if err:
+        return {"error": err}, 400
+    try:
+        min_duration = int(request.args.get("min_duration_seconds", "0"))
+        max_results = int(request.args.get("max_results", "50"))
+    except (TypeError, ValueError):
+        return {"error": "'min_duration_seconds' and 'max_results' must be integers"}, 400
+
+    try:
+        youtube, _ = get_youtube_client(credentials)
+        info = resolve_channel(youtube, channel)
+        recent = fetch_channel_recent_videos(
+            youtube, info["uploadsPlaylistId"], published_after, max_results=max_results
+        )
+        details = fetch_video_details(youtube, [v["videoId"] for v in recent]) if recent else {}
+    except ValueError as exc:
+        return {"error": str(exc)}, 404
+    except Exception as exc:
+        return {"error": str(exc)}, 500
+
+    videos = []
+    for v in recent:
+        d = details.get(v["videoId"], {})
+        duration = d.get("durationSeconds", 0)
+        if duration < min_duration:
+            continue
+        videos.append({
+            "videoId": v["videoId"],
+            "title": v["title"],
+            "url": f"https://www.youtube.com/watch?v={v['videoId']}",
+            "publishedAt": v["publishedAt"],
+            "durationSeconds": duration,
+            "channelTitle": d.get("channelTitle") or info["channelTitle"],
+        })
+    return {
+        "channelId": info["channelId"],
+        "channelTitle": info["channelTitle"],
+        "sinceHours": since_hours,
+        "returned": len(videos),
+        "videos": videos,
+    }
+
+
+@app.route("/api/playlist-membership", methods=["POST"])
+def api_playlist_membership():
+    """Report which of the given playlists already contain each video id.
+
+    Body: {video_ids: [...], playlists: [name_or_id, ...]}.
+    Returns {membership: {videoId: [playlist refs containing it]},
+             resolved: {ref: playlistId}, unresolvedPlaylists: [...]}.
+    Read-only: costs 1 unit per 50 items in each playlist scanned.
+    """
+    credentials = get_credentials_from_request()
+    if not credentials:
+        return {"error": "Not authenticated"}, 401
+    payload = request.get_json(silent=True) or {}
+    video_ids = payload.get("video_ids") or []
+    playlist_refs = payload.get("playlists") or []
+    if not isinstance(video_ids, list) or not video_ids:
+        return {"error": "No video IDs provided"}, 400
+    if not isinstance(playlist_refs, list) or not playlist_refs:
+        return {"error": "No playlists provided"}, 400
+    try:
+        youtube, _ = get_youtube_client(credentials)
+    except Exception as exc:
+        return {"error": str(exc)}, 500
+
+    membership = {vid: [] for vid in video_ids if vid}
+    resolved = {}
+    unresolved = []
+    for ref in playlist_refs:
+        pid, _ = resolve_playlist_ref(credentials, ref)
+        if not pid:
+            unresolved.append(ref)
+            continue
+        try:
+            present = fetch_playlist_video_ids(youtube, pid)
+        except Exception:
+            unresolved.append(ref)
+            continue
+        resolved[ref] = pid
+        for vid in membership:
+            if vid in present:
+                membership[vid].append(ref)
+    return {"membership": membership, "resolved": resolved, "unresolvedPlaylists": unresolved}
+
+
+@app.route("/api/add-from-channels", methods=["POST"])
+def api_add_from_channels():
+    """Add recent channel uploads to a playlist, with dedup + duration filtering.
+
+    Body:
+        playlist:             target playlist name or id (required).
+        channels:             list of @handles / URLs / IDs (required).
+        since_hours:          recency window in hours (default 24).
+        published_after:      ISO8601 cutoff (overrides since_hours).
+        min_duration_seconds: skip videos shorter than this (default 0).
+        exclude_playlists:    names/ids whose videos must NOT be re-added.
+
+    A video is added only if it is within the window, at least
+    min_duration_seconds long, and not already in the target or any excluded
+    playlist. Returns a per-channel breakdown plus totals.
+    """
+    credentials = get_credentials_from_request()
+    if not credentials:
+        return {"error": "Not authenticated"}, 401
+    payload = request.get_json(silent=True) or {}
+    channels = payload.get("channels") or []
+    if not isinstance(channels, list) or not channels:
+        return {"error": "No channels provided"}, 400
+    since_hours, published_after, err = _resolve_time_window(payload)
+    if err:
+        return {"error": err}, 400
+    try:
+        min_duration = int(payload.get("min_duration_seconds") or 0)
+    except (TypeError, ValueError):
+        return {"error": "'min_duration_seconds' must be an integer"}, 400
+    exclude_refs = payload.get("exclude_playlists") or []
+    if not isinstance(exclude_refs, list):
+        return {"error": "'exclude_playlists' must be a list"}, 400
+
+    target_id, _ = resolve_playlist_ref(credentials, payload.get("playlist"))
+    if not target_id:
+        return {"error": f"No playlist named {payload.get('playlist')!r}"}, 404
+
+    try:
+        youtube, _ = get_youtube_client(credentials)
+    except Exception as exc:
+        return {"error": str(exc)}, 500
+
+    # Exclusion set = target playlist ∪ each excluded playlist.
+    try:
+        exclusion = fetch_playlist_video_ids(youtube, target_id)
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": "Destination playlist could not be read: " + str(exc),
+        }, 500
+    unresolved_excludes = []
+    for ref in exclude_refs:
+        pid, _ = resolve_playlist_ref(credentials, ref)
+        if not pid:
+            unresolved_excludes.append(ref)
+            continue
+        try:
+            exclusion |= fetch_playlist_video_ids(youtube, pid)
+        except Exception:
+            unresolved_excludes.append(ref)
+
+    # Discover recent uploads per channel.
+    results = {}
+    order = []
+    candidates = []  # (video_id, channel)
+    for ch in channels:
+        if ch not in results:
+            results[ch] = {
+                "channel": ch, "channelTitle": None, "recent": 0,
+                "added": 0, "skippedPresent": 0, "skippedShort": 0,
+                "failures": [], "error": None,
+            }
+            order.append(ch)
+        try:
+            info = resolve_channel(youtube, ch)
+            recent = fetch_channel_recent_videos(youtube, info["uploadsPlaylistId"], published_after)
+        except Exception as exc:
+            results[ch]["error"] = str(exc)
+            continue
+        results[ch]["channelTitle"] = info["channelTitle"]
+        results[ch]["recent"] += len(recent)
+        for v in recent:
+            candidates.append((v["videoId"], ch))
+
+    # One batched duration lookup for every candidate, then a pure filter.
+    all_ids = [vid for vid, _ in candidates]
+    details = fetch_video_details(youtube, all_ids) if all_ids else {}
+    to_add, filter_stats = filter_candidates(candidates, details, exclusion, min_duration)
+    for ch, s in filter_stats.items():
+        results[ch]["skippedPresent"] += s["skippedPresent"]
+        results[ch]["skippedShort"] += s["skippedShort"]
+
+    # Insert survivors, respecting the daily write budget.
+    budget = remaining_write_budget()
+    added_total = 0
+    quota_blocked = False
+    for video_id, ch in to_add:
+        if budget <= 0:
+            quota_blocked = True
+            # These would have been added; report them as blocked, not skipped.
+            results[ch]["failures"].append({"videoId": video_id, "error": "quota exhausted"})
+            continue
+        try:
+            youtube.playlistItems().insert(
+                part="snippet",
+                body={"snippet": {
+                    "playlistId": target_id,
+                    "resourceId": {"kind": "youtube#video", "videoId": video_id},
+                }},
+            ).execute()
+            record_api_call(endpoint="playlistItems.insert", call_type="insert")
+            results[ch]["added"] += 1
+            added_total += 1
+            budget -= 1
+        except Exception as exc:
+            results[ch]["failures"].append({"videoId": video_id, "error": str(exc)})
+
+    if added_total:
+        invalidate_playlist_cache(credentials)
+    any_error = any(r["error"] or r["failures"] for r in results.values())
+    return {
+        "success": not any_error and not quota_blocked,
+        "playlist": payload.get("playlist"),
+        "playlistId": target_id,
+        "sinceHours": since_hours,
+        "added": added_total,
+        "quotaBlocked": quota_blocked,
+        "unresolvedExcludePlaylists": unresolved_excludes,
+        "byChannel": [results[ch] for ch in order],
     }
 
 
@@ -1014,6 +1451,19 @@ def playlist_items(playlist_id):
                 "thumbnail": ((snippet.get("thumbnails") or {}).get("default") or {}).get("url"),
             }
         )
+    # Opt-in enrichment: attach duration/publishedAt/channel via a batched
+    # videos.list (1 extra unit per 50 items). Off by default to save quota.
+    include_details = (request.args.get("details") or "").lower() in ("1", "true", "yes")
+    if include_details and simplified:
+        try:
+            video_details = fetch_video_details(youtube, [s["videoId"] for s in simplified])
+        except Exception:
+            video_details = {}
+        for s in simplified:
+            d = video_details.get(s["videoId"], {})
+            s["durationSeconds"] = d.get("durationSeconds")
+            s["publishedAt"] = d.get("publishedAt")
+            s["channelTitle"] = d.get("channelTitle")
     return {
         "items": simplified,
         "nextPageToken": response.get("nextPageToken"),

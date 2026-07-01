@@ -79,9 +79,11 @@ Add to your `claude_desktop_config.json`:
 
 | Tool | Description |
 |------|-------------|
-| `list_playlists` | List all user playlists with metadata |
-| `get_playlist_items` | Fetch videos in a playlist (paginated) |
+| `list_playlists` | List all user playlists with metadata (id, title, url, ...) |
+| `get_playlist_items` | Fetch videos in a playlist (paginated); pass `details=true` for duration/publishedAt/channel |
+| `get_channel_videos` | List a channel's recent uploads (by @handle/URL/ID) with duration and publish time |
 | `random_videos` | Return N random videos from a playlist (by name), sampled across ALL its videos |
+| `check_playlist_membership` | Check which playlists already contain each of the given videos |
 | `get_quota_status` | Check remaining API budget and savings stats |
 
 ### Write Operations (50 quota units each)
@@ -94,6 +96,7 @@ Add to your `claude_desktop_config.json`:
 | `cleanup_playlist` | Remove deleted/private videos |
 | `dedupe_playlist` | Remove duplicate videos |
 | `import_videos` | Add videos to a playlist by ID |
+| `add_channel_videos_to_playlist` | Add recent uploads from channels to a playlist, with dedup (incl. exclude playlists) and min-duration filtering, in one call |
 | `transfer_items` | Copy/move videos between playlists |
 | `merge_playlists` | Combine multiple playlists into one |
 
