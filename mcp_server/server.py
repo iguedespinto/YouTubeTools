@@ -63,7 +63,13 @@ def _request(
 def list_playlists() -> dict[str, Any]:
     """List all user playlists with metadata.
 
-    Returns a list of playlists with id, title, description, itemCount, and thumbnailUrl.
+    Returns a list of playlists, each with:
+        id: The YouTube playlist ID.
+        title: The playlist name.
+        url: Direct link to the playlist (https://www.youtube.com/playlist?list=<id>).
+        description: The playlist description.
+        itemCount: Number of videos in the playlist.
+        thumbnailUrl: URL of the playlist's default thumbnail.
     Quota cost: 1 unit per 50 playlists (cached server-side).
     """
     return _request("GET", "/api/playlists")
