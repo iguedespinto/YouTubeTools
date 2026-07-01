@@ -26,6 +26,16 @@ FLASK_SECRET_KEY="change_me" python app.py
 
 Then open `http://127.0.0.1:3000` and connect your YouTube account.
 
+## Tests
+
+Pure helpers live in `yt_lib.py` (no Flask/Mongo imports) so they can be tested
+without a database:
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
 ## Notes
 
 - You can set a custom path for the client secrets file using `YT_CLIENT_SECRETS`.

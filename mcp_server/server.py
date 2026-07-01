@@ -76,22 +76,88 @@ def list_playlists() -> dict[str, Any]:
 
 
 @mcp.tool()
-def get_playlist_items(playlist_id: str, page_token: str | None = None) -> dict[str, Any]:
+def get_playlist_items(
+    playlist_id: str,
+    page_token: str | None = None,
+    details: bool = False,
+) -> dict[str, Any]:
     """Fetch videos in a playlist (paginated, 50 per page).
 
     Args:
         playlist_id: The YouTube playlist ID.
         page_token: Optional token for pagination (from nextPageToken in previous response).
+        details: If True, enrich each item with durationSeconds, publishedAt,
+                 and channelTitle (costs 1 extra unit per 50 items). Default False.
 
-    Returns items with playlistItemId, videoId, title, and thumbnail.
-    Also returns nextPageToken if more pages exist, and deadCount/deadItemIds for
-    deleted/private videos.
-    Quota cost: 1 unit per page.
+    Returns items with playlistItemId, videoId, title, and thumbnail (plus the
+    detail fields when details=True). Also returns nextPageToken if more pages
+    exist, and deadCount/deadItemIds for deleted/private videos.
+    Quota cost: 1 unit per page (+1 unit per 50 items when details=True).
     """
-    params = {}
+    params: dict[str, Any] = {}
     if page_token:
         params["pageToken"] = page_token
+    if details:
+        params["details"] = "true"
     return _request("GET", f"/playlist/{playlist_id}/items", params=params)
+
+
+@mcp.tool()
+def get_channel_videos(
+    channel: str,
+    since_hours: float = 24.0,
+    min_duration_seconds: int = 0,
+    max_results: int = 50,
+) -> dict[str, Any]:
+    """List a channel's recent uploads, with duration and publish time.
+
+    Resolves a channel by @handle, channel URL, or UC... ID (handle→uploads
+    mappings are cached server-side, so repeat scans are quota-free), then
+    returns uploads within the recency window.
+
+    Args:
+        channel: @handle (e.g. "@DenysDavydov"), channel URL, or UC... channel ID.
+        since_hours: Only return videos published within this many hours (default 24).
+        min_duration_seconds: Drop videos shorter than this (default 0 = no filter).
+        max_results: Maximum number of videos to return (default 50).
+
+    Returns channelId, channelTitle, and videos with videoId, title, url,
+    publishedAt, durationSeconds, and channelTitle.
+    Quota cost: 1 unit to resolve (cached), 1 unit per page of uploads scanned,
+                1 unit per 50 videos for duration lookup.
+    """
+    return _request(
+        "GET",
+        "/api/channel/videos",
+        params={
+            "channel": channel,
+            "since_hours": since_hours,
+            "min_duration_seconds": min_duration_seconds,
+            "max_results": max_results,
+        },
+    )
+
+
+@mcp.tool()
+def check_playlist_membership(
+    video_ids: list[str],
+    playlists: list[str],
+) -> dict[str, Any]:
+    """Check which playlists already contain each of the given videos.
+
+    Args:
+        video_ids: YouTube video IDs to look up.
+        playlists: Playlist names or IDs to scan.
+
+    Returns membership (videoId -> list of playlist refs containing it),
+    resolved (ref -> playlistId), and unresolvedPlaylists.
+    Quota cost: 1 unit per 50 items in each scanned playlist.
+    """
+    return _request(
+        "POST",
+        "/api/playlist-membership",
+        json_body={"video_ids": video_ids, "playlists": playlists},
+    )
 
 
 @mcp.tool()
@@ -219,6 +285,48 @@ def import_videos(playlist_id: str, video_ids: list[str]) -> dict[str, Any]:
     Quota cost: 50 units per video added (videos already present are free).
     """
     return _request("POST", f"/playlist/{playlist_id}/import", json_body={"video_ids": video_ids})
+
+
+@mcp.tool()
+def add_channel_videos_to_playlist(
+    playlist: str,
+    channels: list[str],
+    since_hours: float = 24.0,
+    min_duration_seconds: int = 0,
+    exclude_playlists: list[str] | None = None,
+) -> dict[str, Any]:
+    """Add recent uploads from several channels to a playlist, in one call.
+
+    For each channel, finds uploads within the recency window, then adds a video
+    ONLY if it is at least min_duration_seconds long AND not already in the
+    target playlist or any excluded playlist. Handles resolution, dedup, and
+    duration filtering server-side so the whole workflow is one reliable call.
+
+    Args:
+        playlist: Target playlist name or ID to add videos to.
+        channels: List of @handles, channel URLs, or UC... IDs to pull from.
+        since_hours: Recency window in hours (default 24).
+        min_duration_seconds: Skip videos shorter than this (default 0 = no filter).
+        exclude_playlists: Playlist names/IDs whose videos must not be re-added
+                           (e.g. an "already played" list).
+
+    Returns added (total), quotaBlocked, unresolvedExcludePlaylists, and a
+    byChannel breakdown with per-channel added / skippedPresent / skippedShort /
+    failures / error.
+    Quota cost: reads to scan channels + exclusion playlists (1 unit each per
+                page/50), plus 50 units per video actually added.
+    """
+    return _request(
+        "POST",
+        "/api/add-from-channels",
+        json_body={
+            "playlist": playlist,
+            "channels": channels,
+            "since_hours": since_hours,
+            "min_duration_seconds": min_duration_seconds,
+            "exclude_playlists": exclude_playlists or [],
+        },
+    )
 
 
 @mcp.tool()
