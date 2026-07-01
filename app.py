@@ -765,12 +765,14 @@ def api_playlists():
             record_savings("cache", pages, pages)
         if IGNORED_PLAYLIST_IDS:
             playlists = [p for p in playlists if p.get("id") not in IGNORED_PLAYLIST_IDS]
-        # Simplify for MCP: return id, title, itemCount
+        # Simplify for MCP: return id, title, url, itemCount
         simplified = []
         for p in playlists:
+            playlist_id = p.get("id")
             simplified.append({
-                "id": p.get("id"),
+                "id": playlist_id,
                 "title": (p.get("snippet") or {}).get("title"),
+                "url": f"https://www.youtube.com/playlist?list={playlist_id}" if playlist_id else None,
                 "description": (p.get("snippet") or {}).get("description"),
                 "itemCount": (p.get("contentDetails") or {}).get("itemCount", 0),
                 "thumbnailUrl": (((p.get("snippet") or {}).get("thumbnails") or {}).get("default") or {}).get("url"),
