@@ -129,6 +129,17 @@ if IS_PRODUCTION:
     app.config["PREFERRED_URL_SCHEME"] = "https"
 
 
+@app.context_processor
+def inject_css_version():
+    """Cache-bust the static stylesheet by its mtime so a deploy never serves
+    new templates against a stale, browser-cached app.css."""
+    try:
+        mtime = os.path.getmtime(os.path.join(app.static_folder, "css", "app.css"))
+        return {"css_v": int(mtime)}
+    except OSError:
+        return {"css_v": 0}
+
+
 @app.before_request
 def check_bearer_auth():
     """Authenticate Bearer tokens for allowed API endpoints.

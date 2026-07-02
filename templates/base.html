@@ -4,69 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>YouTube Playlists</title>
-    <style>
-      body { font-family: Arial, sans-serif; margin: 24px; }
-      .container { max-width: 1800px; margin: 0 auto; }
-      .actions { margin-top: 16px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-      label { display: inline-flex; gap: 6px; align-items: center; }
-      select { padding: 6px; border-radius: 4px; border: 1px solid #ccc; }
-      input[type="text"] { padding: 6px; border-radius: 4px; border: 1px solid #ccc; width: 220px; }
-      .search-input { position: relative; display: inline-flex; align-items: center; }
-      .clear-search { position: absolute; right: 6px; background: transparent; border: none; color: #666; font-size: 16px; cursor: pointer; display: none; }
-      .clear-search:hover { color: #000; }
-      button.btn { border: none; cursor: pointer; }
-      .btn { display: inline-block; padding: 8px 12px; background: #1f6feb; color: #fff; text-decoration: none; border-radius: 4px; }
-      .btn.secondary { background: #444; }
-      .btn.danger { background: #b00020; }
-      ul { list-style: none; padding: 0; }
-      li { padding: 10px 0; border-bottom: 1px solid #eee; }
-      .playlist-list { max-height: 70vh; overflow: auto; margin: 0; }
-      .playlist-list li { display: flex; align-items: center; gap: 12px; }
-      .playlist-list li.active { background: #eef5ff; border-radius: 6px; }
-      .playlist-info { display: flex; flex-direction: column; gap: 4px; }
-      .playlist-layout { display: grid; grid-template-columns: 1fr 2fr; gap: 24px; align-items: stretch; }
-      .playlist-list-pane { min-width: 320px; }
-      .playlist-viewer-pane { display: flex; flex-direction: column; max-height: 70vh; overflow: hidden; }
-      #playlist-viewer { width: 100%; flex: 1; border: 1px solid #ddd; border-radius: 6px; background: #fafafa; padding: 12px; box-sizing: border-box; overflow: auto; }
-      .viewer-header { font-weight: bold; margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-      .viewer-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-      .viewer-status { color: #666; font-size: 14px; font-weight: normal; margin-top: 4px; }
-      .viewer-hint { color: #666; font-size: 14px; margin-top: 8px; }
-      .viewer-items { margin: 0; padding-left: 20px; }
-      .viewer-items li { border-bottom: none; padding: 12px 0; display: flex; align-items: center; gap: 12px; min-height: 90px; }
-      .viewer-items li .video-select { width: 18px; height: 18px; }
-      .video-thumb { width: 150px; height: 90px; object-fit: cover; border-radius: 4px; background: #000; flex: 0 0 auto; }
-      .bulk-actions { margin-bottom: 10px; }
-      .bulk-actions input[type="number"] { width: 110px; padding: 6px; border-radius: 4px; border: 1px solid #ccc; }
-      .merge-status { color: #666; font-size: 14px; }
-      .dedupe-status { color: #666; font-size: 13px; }
-      .playlist-select { width: 18px; height: 18px; }
-      .meta { color: #666; font-size: 14px; }
-      .stats-panel { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; margin-top: 8px; }
-      .stat-pill { background: #f1f5f9; border: 1px solid #e2e8f0; border-radius: 999px; padding: 4px 12px; font-size: 13px; color: #334155; }
-      .stat-pill strong { color: #0f172a; }
-      .stat-pill.saved { background: #ecfdf5; border-color: #a7f3d0; color: #065f46; }
-      .stat-pill.saved strong { color: #047857; }
-      .stat-pill.used strong { color: #b45309; }
-      .cost-legend { color: #94a3b8; font-size: 12px; margin-top: 6px; }
-      .cost-legend code { background: #f1f5f9; border-radius: 3px; padding: 0 4px; }
-      .error { color: #b00020; }
-      .playlist-link { color: #000; font-weight: bold; text-decoration: none; }
-      .playlist-link:hover { text-decoration: underline; }
-      .scroll-loading { text-align: center; padding: 12px; color: #666; font-size: 14px; }
-      .import-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.4); display: flex; align-items: center; justify-content: center; z-index: 1000; display: none; }
-      .import-modal-overlay.visible { display: flex; }
-      .import-modal { background: #fff; border-radius: 8px; padding: 24px; max-width: 600px; width: 90%; max-height: 80vh; overflow: auto; }
-      .import-modal h3 { margin-top: 0; }
-      .import-modal textarea { width: 100%; height: 200px; font-family: monospace; font-size: 13px; padding: 8px; border: 1px solid #ccc; border-radius: 4px; resize: vertical; box-sizing: border-box; }
-      .import-modal label { display: block; font-size: 14px; color: #444; margin-bottom: 4px; }
-      .import-modal input[type="text"],
-      .import-modal select { width: 100%; box-sizing: border-box; padding: 10px 12px; font-size: 15px; border: 1px solid #ccc; border-radius: 6px; }
-      .import-modal input[type="text"]:focus,
-      .import-modal select:focus { outline: none; border-color: #1f6feb; box-shadow: 0 0 0 3px rgba(31,111,235,0.15); }
-      .import-modal .actions { margin-top: 16px; }
-      .import-status { margin-top: 8px; color: #666; font-size: 14px; }
-    </style>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v={{ css_v }}">
   </head>
   <body>
     <div class="container">
