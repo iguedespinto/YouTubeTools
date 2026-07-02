@@ -1,4 +1,6 @@
 :root {
+  color-scheme: light;
+
   /* ---- Colour tokens (scheme axis) — values are today's exact design ---- */
   --accent: #1f6feb;
   --accent-contrast: #fff;
@@ -43,6 +45,82 @@
   --radius-lg: 8px;
   --radius-pill: 999px;
   --border-width: 1px;
+}
+
+/* A scheme is a small colour-token override block. Structural tokens are
+   inherited from :root, so schemes never repeat radii/border sizes. */
+[data-theme="dark"] {
+  color-scheme: dark;
+  --accent: #0a84ff;
+  --accent-contrast: #fff;
+  --accent-tint: rgba(10,132,255,0.24);
+  --focus-ring: rgba(10,132,255,0.40);
+  --danger: #ff453a;
+
+  --bg: #151517;
+  --surface: #1e1e21;
+  --surface-inset: #1a1a1c;
+  --scrim: rgba(0,0,0,0.55);
+  --thumb-bg: #000;
+
+  --text: rgba(255,255,255,0.92);
+  --text-secondary: rgba(235,235,245,0.62);
+  --text-muted: rgba(235,235,245,0.55);
+  --text-faint: rgba(235,235,245,0.38);
+
+  --btn-secondary-bg: #2c2c2e;
+
+  --border: #3a3a3c;
+  --border-soft: #2c2c2e;
+  --divider: #2c2c2e;
+
+  --chip-bg: rgba(255,255,255,0.06);
+  --chip-border: rgba(255,255,255,0.10);
+  --chip-text: rgba(235,235,245,0.62);
+  --chip-text-strong: rgba(255,255,255,0.92);
+
+  --success-bg: rgba(48,209,88,0.14);
+  --success-border: rgba(48,209,88,0.30);
+  --success-text: #30d158;
+  --success-text-strong: #30d158;
+  --warning-text: #ff9f0a;
+}
+
+[data-theme="midnight"] {
+  color-scheme: dark;
+  --accent: #2f88ff;
+  --accent-contrast: #fff;
+  --accent-tint: rgba(77,163,255,0.22);
+  --focus-ring: rgba(77,163,255,0.40);
+  --danger: #ff6961;
+
+  --bg: #0e1420;
+  --surface: #141c2b;
+  --surface-inset: #121a28;
+  --scrim: rgba(2,6,16,0.55);
+  --thumb-bg: #000;
+
+  --text: #e9eefb;
+  --text-secondary: rgba(196,209,238,0.66);
+  --text-muted: rgba(196,209,238,0.58);
+  --text-faint: rgba(196,209,238,0.40);
+
+  --btn-secondary-bg: #22304a;
+
+  --border: #2c3a55;
+  --border-soft: #1f2a3d;
+  --divider: #1f2a3d;
+
+  --chip-bg: rgba(148,178,255,0.10);
+  --chip-border: rgba(148,178,255,0.18);
+  --chip-text: rgba(196,209,238,0.66);
+  --chip-text-strong: #e9eefb;
+
+  --success-bg: rgba(76,217,123,0.14);
+  --success-border: rgba(76,217,123,0.30);
+  --success-text: #4cd97b;
+  --success-text-strong: #4cd97b;
+  --warning-text: #ffb340;
 }
 
 body { font-family: Arial, sans-serif; margin: 24px; background: var(--bg); color: var(--text); }
@@ -106,3 +184,9 @@ li { padding: 10px 0; border-bottom: var(--border-width) solid var(--divider); }
 .import-modal select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
 .import-modal .actions { margin-top: 16px; }
 .import-status { margin-top: 8px; color: var(--text-muted); font-size: 14px; }
+
+/* ---- Appearance switcher (scheme axis control) ---- */
+.theme-switcher { position: fixed; top: 12px; right: 16px; z-index: 1100; display: inline-flex; gap: 2px; padding: 3px; background: var(--chip-bg); border: var(--border-width) solid var(--chip-border); border-radius: var(--radius-pill); }
+.theme-switcher button { border: none; background: transparent; color: var(--text-muted); font: inherit; font-size: 12px; line-height: 1.2; padding: 4px 10px; border-radius: var(--radius-pill); cursor: pointer; }
+.theme-switcher button:hover { color: var(--text); }
+.theme-switcher button[aria-pressed="true"] { background: var(--surface); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,0.18); }

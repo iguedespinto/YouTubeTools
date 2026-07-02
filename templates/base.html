@@ -4,11 +4,64 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>YouTube Playlists</title>
+    <script>
+      /* Apply the saved colour scheme before the stylesheet loads, so there's no
+         flash of the wrong theme. Reads the 'yt-theme' preference; 'auto' (default)
+         follows the OS via prefers-color-scheme. */
+      (function () {
+        try {
+          var pref = localStorage.getItem('yt-theme') || 'auto';
+          var osDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+          var resolved = pref === 'auto' ? (osDark ? 'dark' : 'light') : pref;
+          document.documentElement.setAttribute('data-theme', resolved);
+          document.documentElement.setAttribute('data-theme-pref', pref);
+        } catch (e) {}
+      })();
+    </script>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v={{ css_v }}">
   </head>
   <body>
+    <div class="theme-switcher" role="group" aria-label="Appearance">
+      <button type="button" data-theme-choice="auto">Auto</button>
+      <button type="button" data-theme-choice="light">Light</button>
+      <button type="button" data-theme-choice="dark">Dark</button>
+      <button type="button" data-theme-choice="midnight">Midnight</button>
+    </div>
     <div class="container">
       {% block content %}{% endblock %}
     </div>
+    <script>
+      /* Colour-scheme switcher: persist the choice, apply it live, and follow the
+         OS while in 'auto'. Self-contained; only touches .theme-switcher, so it
+         can't collide with the page scripts. */
+      (function () {
+        var root = document.documentElement;
+        var mq = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+        var buttons = Array.prototype.slice.call(document.querySelectorAll('.theme-switcher button'));
+        function resolve(pref) { return pref === 'auto' ? ((mq && mq.matches) ? 'dark' : 'light') : pref; }
+        function currentPref() { return root.getAttribute('data-theme-pref') || 'auto'; }
+        function reflect() {
+          var pref = currentPref();
+          buttons.forEach(function (b) {
+            b.setAttribute('aria-pressed', String(b.dataset.themeChoice === pref));
+          });
+        }
+        function apply(pref) {
+          root.setAttribute('data-theme', resolve(pref));
+          root.setAttribute('data-theme-pref', pref);
+          try { localStorage.setItem('yt-theme', pref); } catch (e) {}
+          reflect();
+        }
+        buttons.forEach(function (b) {
+          b.addEventListener('click', function () { apply(b.dataset.themeChoice); });
+        });
+        if (mq) {
+          mq.addEventListener('change', function () {
+            if (currentPref() === 'auto') root.setAttribute('data-theme', resolve('auto'));
+          });
+        }
+        reflect();
+      })();
+    </script>
   </body>
 </html>
