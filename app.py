@@ -471,13 +471,20 @@ def normalize_saved_credentials(data):
         expiry = data.get("expiry")
         if isinstance(expiry, str):
             try:
-                parsed = datetime.fromisoformat(expiry)
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
-                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-                data["expiry"] = parsed
+                expiry = datetime.fromisoformat(expiry)
             except ValueError:
-                data.pop("expiry", None)
+                expiry = None
+        # google-auth compares creds.expiry against a *naive* UTC "now", so any
+        # tz-aware expiry (an isoformat string with offset, or a datetime restored
+        # from the Flask session) must be coerced to naive UTC — otherwise
+        # creds.expired raises "can't compare offset-naive and offset-aware
+        # datetimes". Handle datetime objects too, not just strings.
+        if isinstance(expiry, datetime):
+            if expiry.tzinfo is not None:
+                expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
+            data["expiry"] = expiry
+        elif "expiry" in data:
+            data.pop("expiry", None)
         return data
     if data.get("access_token"):
         scopes = data.get("scope") or data.get("scopes") or SCOPES
