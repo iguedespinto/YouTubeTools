@@ -160,6 +160,8 @@
   * { transition: none !important; animation: none !important; }
 }
 
+.hidden { display: none !important; }
+
 body {
   font-family: var(--font-sans);
   font-size: 15px;
@@ -191,10 +193,6 @@ select:focus, input[type="text"]:focus, input[type="number"]:focus, textarea:foc
   outline: none; border-color: var(--accent); box-shadow: 0 0 0 4px var(--focus-ring);
 }
 input[type="checkbox"] { accent-color: var(--accent); }
-.search-input { position: relative; display: inline-flex; align-items: center; }
-.clear-search { position: absolute; right: 6px; background: transparent; border: none; color: var(--text-muted); font-size: 16px; cursor: pointer; display: none; }
-.clear-search:hover { color: var(--text); }
-
 button.btn { border: none; cursor: pointer; font: inherit; }
 .btn {
   display: inline-block;            /* JS contract — do not change */

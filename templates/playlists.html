@@ -56,8 +56,8 @@
     <div class="playlist-layout">
       <div class="playlist-list-pane">
         <div class="bulk-actions actions">
-          <button class="btn danger" type="button" id="delete-selected" style="display: none;" disabled>Delete selected</button>
-          <button class="btn secondary" type="button" id="merge-selected" style="display: none;" disabled onclick="document.getElementById('merge-status').textContent='Merge button clicked.'; startMerge(event);">Merge selected</button>
+          <button class="btn danger hidden" type="button" id="delete-selected" disabled>Delete selected</button>
+          <button class="btn secondary hidden" type="button" id="merge-selected" disabled onclick="document.getElementById('merge-status').textContent='Merge button clicked.'; startMerge(event);">Merge selected</button>
           <span id="merge-status" class="merge-status"></span>
         </div>
         <ul class="playlist-list" id="playlist-list">
@@ -110,7 +110,7 @@
             <button class="btn secondary" type="button" id="copy-selected-videos" disabled>Copy selected</button>
             <button class="btn secondary" type="button" id="move-selected-videos" disabled>Move selected</button>
             <button class="btn danger" type="button" id="delete-selected-videos" disabled>Delete selected videos</button>
-            <button class="btn secondary" type="button" id="cleanup-dead-button" style="display: none;"></button>
+            <button class="btn secondary hidden" type="button" id="cleanup-dead-button"></button>
             <button class="btn secondary" type="button" id="import-videos-button">Import videos</button>
           </div>
         </div>
@@ -287,11 +287,11 @@
       const cached = videoCache[playlistId];
       const count = cached && cached.deadItemIds ? cached.deadItemIds.length : 0;
       if (count > 0 && currentPlaylistId === playlistId) {
-        cleanupDeadButton.style.display = 'inline-block';
+        cleanupDeadButton.classList.remove('hidden');
         cleanupDeadButton.disabled = false;
         cleanupDeadButton.textContent = `Clean up ${count} unavailable video(s) (~${count * 50} units)`;
       } else {
-        cleanupDeadButton.style.display = 'none';
+        cleanupDeadButton.classList.add('hidden');
       }
     }
 
@@ -498,7 +498,7 @@
     function loadPlaylistVideos(playlistId, playlistTitle, rowElement) {
       if (!playlistId) return;
       currentPlaylistId = playlistId;
-      if (cleanupDeadButton) cleanupDeadButton.style.display = 'none';
+      if (cleanupDeadButton) cleanupDeadButton.classList.add('hidden');
       if (viewerTitle && playlistTitle) {
         viewerTitle.textContent = `Playlist videos: ${playlistTitle}`;
       }
@@ -772,7 +772,7 @@
       rows.forEach((row) => {
         const title = row.querySelector('.playlist-link')?.dataset.title || '';
         const matches = title.toLowerCase().includes(normalized);
-        row.style.display = matches ? '' : 'none';
+        row.classList.toggle('hidden', !matches);
       });
     }
 
@@ -1089,11 +1089,11 @@
       const selectedCount = document.querySelectorAll('.playlist-select:checked').length;
       if (bulkDeleteButton) {
         bulkDeleteButton.disabled = !anySelected;
-        bulkDeleteButton.style.display = anySelected ? 'inline-block' : 'none';
+        bulkDeleteButton.classList.toggle('hidden', !anySelected);
       }
       if (mergeSelectedButton) {
         mergeSelectedButton.disabled = selectedCount < 2;
-        mergeSelectedButton.style.display = selectedCount >= 2 ? 'inline-block' : 'none';
+        mergeSelectedButton.classList.toggle('hidden', selectedCount < 2);
       }
     }
 
